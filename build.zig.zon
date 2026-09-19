@@ -1,0 +1,21 @@
+.{
+    .name = .run88k,
+    .version = "0.0.0",
+    .fingerprint = 0xfa6452e5eb5642e3,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        // The MC88100 CPU core. Consumed as source (its root.zig exposes the
+        // native Zig API: cpu.Cpu, cpu.MemoryBus, decode.step). Referenced as a
+        // local path dependency to the sibling checkout.
+        .musashi88k = .{
+            .path = "../musashi88k",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "PLAN.md",
+    },
+}

@@ -1,0 +1,183 @@
+//! run88k — m88k user-mode syscall emulator (CLI entry).
+//!
+//! Milestone 2: `run <binary> [args...]` loads a static ELF32-BE MC88000
+//! executable (UNIX System V/88), sets up the SysV/88 register-handoff process
+//! stack, installs the syscall dispatcher (trap vector 451, number in r9), and
+//! runs the guest, servicing syscalls against the host.
+//!
+//! Uses the current Zig "full" main signature `main(init: std.process.Init)`
+//! and a libc `write` extern for output (stable across the churning std.Io
+//! API, same as the sibling runupc). libc is linked in build.zig.
+
+const std = @import("std");
+const m88k = @import("m88k");
+const mem = @import("mem.zig");
+const machine = @import("machine.zig");
+const elf = @import("loaders/elf.zig");
+const process = @import("process.zig");
+const sysv = @import("abi/sysv88.zig");
+const dispatch = @import("syscalls/dispatch.zig");
+const difftrace = @import("difftrace.zig");
+
+extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+
+fn out(bytes: []const u8) void {
+    _ = write(2, bytes.ptr, bytes.len);
+}
+
+fn outf(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    out(std.fmt.bufPrint(&buf, fmt, args) catch return);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+
+    // Parse leading flags.
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--trace")) {
+            dispatch.trace = true;
+        } else if (std.mem.eql(u8, args[i], "--selftest")) {
+            try selftest(gpa);
+            return;
+        } else break;
+    }
+
+    const rest = args[i..];
+    if (rest.len >= 2 and std.mem.eql(u8, rest[0], "run")) {
+        const code = try cmdRun(gpa, io, rest[1], rest[1..]);
+        std.process.exit(@intCast(code & 0xff));
+    }
+
+    // difftrace <binary> <win_lo_hex> <win_hi_hex> <max> [args...]
+    // Emit a per-instruction JSONL trace on stdout for instructions whose PC is
+    // in [win_lo, win_hi). Diagnostics go to stderr.
+    if (rest.len >= 5 and std.mem.eql(u8, rest[0], "difftrace")) {
+        const lo = std.fmt.parseInt(u32, rest[2], 16) catch 0;
+        const hi = std.fmt.parseInt(u32, rest[3], 16) catch 0xffffffff;
+        const max = std.fmt.parseInt(usize, rest[4], 10) catch 2000;
+        const prog_args = rest[5..];
+        // argv[0] = binary name; if no extra args, pass just the binary.
+        var argv_buf: [64][]const u8 = undefined;
+        argv_buf[0] = rest[1];
+        var n: usize = 1;
+        for (prog_args) |a| {
+            if (n >= argv_buf.len) break;
+            argv_buf[n] = a;
+            n += 1;
+        }
+        try difftrace.run(gpa, io, rest[1], argv_buf[0..n], lo, hi, max);
+        return;
+    }
+
+    out(
+        \\run88k — m88k user-mode syscall emulator (Milestone 2)
+        \\
+        \\Usage:
+        \\  run88k [--trace] run <binary> [args...]   run a SysV/88 m88k ELF binary
+        \\  run88k --selftest                          core-integration self-check
+        \\
+        \\Only static ELF32-BE MC88000 executables are supported so far.
+        \\
+    );
+}
+
+/// Load and run a guest ELF binary. `path` is the host path to the binary;
+/// `argv` is the guest argument vector (argv[0] = program name).
+fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []const u8) !u32 {
+    // Read the whole binary.
+    const image = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch |e| {
+        outf("run88k: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
+        return 127;
+    };
+    defer gpa.free(image);
+
+    var memory = try mem.Memory.init(gpa);
+    defer memory.deinit();
+    defer mem.setActive(null);
+
+    const img = elf.load(&memory, image) catch |e| {
+        outf("run88k: cannot load '{s}': {s}\n", .{ path, @errorName(e) });
+        return 126;
+    };
+
+    var runner = machine.Runner.init(&memory);
+    runner.attachBus(); // sets bus + cpu.reset(); mem.active = &memory
+    runner.syscall_vector = sysv.syscall_vector;
+    runner.handler = &dispatch.dispatch;
+
+    // Environment: minimal for now. crt reads r4 = envp.
+    const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
+    process.setup(&runner, img.entry, img.brk, argv, &envp) catch |e| {
+        outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
+        return 126;
+    };
+
+    // Enforce permissions now that loading + stack setup are done.
+    memory.enforce = true;
+
+    if (dispatch.trace) {
+        outf("run88k: entry={x} brk={x} argc={d}\n", .{ img.entry, img.brk, argv.len });
+    }
+
+    const reason = runner.run(machine.Runner.default_max_steps);
+    switch (reason) {
+        .exited => return runner.exit_status orelse 0,
+        .halted => return 0,
+        .fault => {
+            faultReport(&runner);
+            return 139; // SIGSEGV-ish
+        },
+        .timed_out => {
+            outf("run88k: guest timed out after {d} instructions (runaway?)\n", .{runner.steps_run});
+            return 124;
+        },
+        .trap => {
+            outf("run88k: unexpected trap vector {d} at ppc={x} (not the syscall vector)\n", .{ runner.last_trap, runner.cpu.ppc });
+            return 132;
+        },
+    }
+}
+
+fn faultReport(runner: *machine.Runner) void {
+    const f = runner.memory.fault;
+    outf(
+        "run88k: FAULT kind={s} addr={x} pc={x} ppc={x} ir={x}\n",
+        .{ @tagName(f.kind), f.address, runner.cpu.pc, runner.cpu.ppc, runner.cpu.ir },
+    );
+    // Dump r1..r13 for context (the ABI-relevant registers).
+    var idx: u5 = 1;
+    while (idx <= 13) : (idx += 1) {
+        outf("  r{d}={x}\n", .{ idx, runner.cpu.getReg(idx) });
+    }
+}
+
+/// Core-integration self-check: assemble and run a SysV/88 syscall trap.
+fn selftest(gpa: std.mem.Allocator) !void {
+    var memory = try mem.Memory.init(gpa);
+    defer memory.deinit();
+    defer mem.setActive(null);
+    memory.enforce = false;
+
+    const entry: u32 = 0x0001_0000;
+    memory.write32(entry + 0, (@as(u32, 0x18) << 26) | (@as(u32, 9) << 21) | 4); // addu r9,r0,4
+    memory.write32(entry + 4, 0xf000_d1c3); // tb0 0,r0,451
+
+    var runner = machine.Runner.init(&memory);
+    runner.attachBus();
+    runner.setPc(entry);
+
+    const reason = runner.run(100);
+    const num = runner.getReg(machine.Reg.syscall_num);
+    outf("selftest: stop={s} last_trap={d} r9={d}\n", .{ @tagName(reason), runner.last_trap, num });
+    if (reason == .trap and runner.last_trap == 451 and num == 4) {
+        out("selftest: PASS\n");
+    } else {
+        out("selftest: FAIL\n");
+        return error.SelftestFailed;
+    }
+}
