@@ -22,8 +22,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root.addImport("m88k", m88k_mod);
-    root.link_libc = true; // libc externs (write, stat shim) for host-backed syscalls
+    root.link_libc = true; // libc externs (write, stat/dir shims) for host-backed syscalls
     root.addCSourceFile(.{ .file = b.path("src/host_stat.c"), .flags = &.{"-std=gnu11"} });
+    root.addCSourceFile(.{ .file = b.path("src/host_dir.c"), .flags = &.{"-std=gnu11"} });
 
     const exe = b.addExecutable(.{
         .name = "run88k",
@@ -63,6 +64,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("m88k", m88k_mod);
     test_mod.link_libc = true;
     test_mod.addCSourceFile(.{ .file = b.path("src/host_stat.c"), .flags = &.{"-std=gnu11"} });
+    test_mod.addCSourceFile(.{ .file = b.path("src/host_dir.c"), .flags = &.{"-std=gnu11"} });
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 }

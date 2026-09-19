@@ -158,6 +158,37 @@ Proof from the linked `echo` entry (0x200b0):
 (The 88110 entry variant `crt0.o` is available in the project for cross-check if
 a difference ever shows up; `crt1.o` is the one linked into these binaries.)
 
+## struct stat layout (RECOVERED — two variants)
+
+The guest `sys/stat.h` defines two `struct stat` layouts. On this R4.0 userland
+the syscalls stat(18)/fstat(28)/lstat(88) (and the versioned xstat/lxstat/fxstat
+123–125) use the **NEW** "user-level 4.0 / kernel xstat" struct — all leading
+fields 32-bit, 4-byte aligned:
+
+```
+st_dev@0 st_ino@4 st_mode@8 st_nlink@12 st_uid@16 st_gid@20 st_rdev@24
+st_size@28 st_atime@32 st_ausec@36 st_mtime@40 st_musec@44 st_ctime@48
+st_cusec@52 st_atim@56(8) st_mtim@64(8) st_ctim@72(8) st_blksize@80
+st_blocks@84 st_fstype[16]@88 st_pading[408]@104   (total 512 bytes)
+```
+
+Note st_mode is at **offset 8** (32-bit), NOT offset 4/16-bit as in the older
+pre-4.0 struct. Getting this wrong makes `ls`/`pwd` see files as "not a
+directory". S_IF* values (S_IFDIR=0x4000, S_IFCHR=0x2000, ...) match host Linux.
+
+## struct dirent + getdents
+
+`getdents(2)` fills `struct dirent { ulong d_ino; long d_off; ushort d_reclen;
+char d_name[]; }` — d_ino@0, d_off@4, d_reclen@8, d_name@10, d_reclen rounded up
+to a 4-byte multiple. Backed by a host opendir/readdir shim (`src/host_dir.c`)
+with one-entry pushback for buffer boundaries.
+
+KNOWN ISSUE: `ls` currently lists only a few entries of a large directory (the
+first getdents returns ~1KB of correct records, but ls stops early). The dirent
+records verify correct in isolation, so the remaining discrepancy is likely
+d_off semantics or ls's malloc/seek expectations — a follow-up. `cat`, `pwd`,
+`ls <symlink>`, and small dirs work.
+
 ## Toolchain (the headline workload)
 
 `/usr/ccs` is the C Compilation System: `cc`, `as`, `ld`, `cpp` (via cc),

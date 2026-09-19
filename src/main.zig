@@ -18,6 +18,8 @@ const process = @import("process.zig");
 const sysv = @import("abi/sysv88.zig");
 const dispatch = @import("syscalls/dispatch.zig");
 const difftrace = @import("difftrace.zig");
+const fsmod = @import("fs.zig");
+const dynamic = @import("loaders/dynamic.zig");
 
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
@@ -36,20 +38,38 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
-    // Parse leading flags.
+    // Parse leading flags. --root sets guest "/"; --mount GUEST=HOST adds a
+    // mount (repeatable). Up to 16 mounts.
     var i: usize = 1;
+    var mounts: [16]fsmod.Mount = undefined;
+    var nmounts: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--trace")) {
             dispatch.trace = true;
         } else if (std.mem.eql(u8, args[i], "--selftest")) {
             try selftest(gpa);
             return;
+        } else if (std.mem.eql(u8, args[i], "--root") and i + 1 < args.len) {
+            if (nmounts < mounts.len) {
+                mounts[nmounts] = .{ .guest_prefix = "/", .host_root = args[i + 1] };
+                nmounts += 1;
+            }
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--mount") and i + 1 < args.len) {
+            const spec = args[i + 1];
+            if (std.mem.indexOfScalar(u8, spec, '=')) |eq| {
+                if (nmounts < mounts.len) {
+                    mounts[nmounts] = .{ .guest_prefix = spec[0..eq], .host_root = spec[eq + 1 ..] };
+                    nmounts += 1;
+                }
+            }
+            i += 1;
         } else break;
     }
 
     const rest = args[i..];
     if (rest.len >= 2 and std.mem.eql(u8, rest[0], "run")) {
-        const code = try cmdRun(gpa, io, rest[1], rest[1..]);
+        const code = try cmdRun(gpa, io, rest[1], rest[1..], mounts[0..nmounts]);
         std.process.exit(@intCast(code & 0xff));
     }
 
@@ -88,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// Load and run a guest ELF binary. `path` is the host path to the binary;
 /// `argv` is the guest argument vector (argv[0] = program name).
-fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []const u8) !u32 {
+fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []const u8, mounts: []const fsmod.Mount) !u32 {
     // Read the whole binary.
     const image = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch |e| {
         outf("run88k: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
@@ -105,10 +125,34 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
         return 126;
     };
 
+    // Guest filesystem (mount table + fd table), if any mounts were given.
+    var fs: ?fsmod.Fs = null;
+    if (mounts.len > 0) {
+        fs = try fsmod.Fs.init(gpa);
+        for (mounts) |m| fs.?.addMount(m.guest_prefix, m.host_root) catch {};
+    }
+    defer if (fs) |*f| f.deinit();
+
     var runner = machine.Runner.init(&memory);
     runner.attachBus(); // sets bus + cpu.reset(); mem.active = &memory
     runner.syscall_vector = sysv.syscall_vector;
     runner.handler = &dispatch.dispatch;
+    if (fs) |*f| runner.fs = f;
+
+    // Dynamic linking: load NEEDED libraries and apply relocations. Requires a
+    // mount table so the interpreter/libraries resolve.
+    if (img.is_dynamic) {
+        if (fs) |*f| {
+            dynamic.reset();
+            dynamic.link(&memory, f, io, gpa, img.dynamic_vaddr, img.brk) catch |e| {
+                outf("run88k: dynamic link failed: {s}\n", .{@errorName(e)});
+                return 126;
+            };
+        } else {
+            outf("run88k: '{s}' is dynamically linked; pass --root/--mount so libraries resolve\n", .{path});
+            return 126;
+        }
+    }
 
     // Environment: minimal for now. crt reads r4 = envp.
     const envp = [_][]const u8{"PATH=/usr/bin:/bin"};

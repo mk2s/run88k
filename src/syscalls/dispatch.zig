@@ -18,9 +18,17 @@ const mem = @import("../mem.zig");
 const machine = @import("../machine.zig");
 const sysv = @import("../abi/sysv88.zig");
 const table = @import("table_sysv88.zig");
+const fsmod = @import("../fs.zig");
 
 const Cpu = m88k.Cpu;
 const Syscall = table.Syscall;
+
+/// Get the filesystem from the runner (type-erased). Null if not configured
+/// (early milestones ran without a guest root).
+fn fsOf(runner: *machine.Runner) ?*fsmod.Fs {
+    const p = runner.fs orelse return null;
+    return @ptrCast(@alignCast(p));
+}
 
 // Host libc for the file operations (stable, portable).
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
@@ -48,6 +56,7 @@ const HostStat = extern struct {
 };
 extern fn r88k_fstat(fd: c_int, out: *HostStat) void;
 extern fn r88k_stat(path: [*:0]const u8, out: *HostStat) void;
+extern fn r88k_lstat(path: [*:0]const u8, out: *HostStat) void;
 extern fn r88k_s_ifmt() c_uint;
 
 fn hostErrno() u32 {
@@ -89,6 +98,10 @@ pub fn dispatch(runner: *machine.Runner) bool {
         .brk => return sysBrk(runner),
         .fstat => return sysFstat(runner),
         .stat => return sysStat(runner),
+        .lstat => return sysLstat(runner),
+        .access => return sysAccess(runner),
+        .chdir => return sysChdir(runner),
+        .dup => return sysDup(runner),
         // ioctl on a tty is common at startup; report "not a tty" so libc
         // treats stdout as a plain file (fine for echo redirection).
         .ioctl => {
@@ -96,6 +109,28 @@ pub fn dispatch(runner: *machine.Runner) bool {
             return true;
         },
         .fcntl => return sysFcntl(runner),
+        .time => return sysTime(runner),
+        .mmap => return sysMmap(runner),
+        .getdents => return sysGetdents(runner),
+        // Identity/permission syscalls: report plausible values so libc is happy.
+        .getpid => {
+            sysv.returnSuccess2(cpu, 1, 0); // pid=1, ppid=0
+            return true;
+        },
+        .getuid => {
+            sysv.returnSuccess2(cpu, 0, 0); // uid=0, euid=0 (root, matches guest)
+            return true;
+        },
+        .getgid => {
+            sysv.returnSuccess2(cpu, 0, 0);
+            return true;
+        },
+        .umask => {
+            const old = runner.umask;
+            runner.umask = sysv.arg(cpu, 0) & 0o777;
+            sysv.returnSuccess(cpu, old);
+            return true;
+        },
         else => {
             failFast(runner, num, sc);
             return false;
@@ -132,17 +167,19 @@ fn mapErrno(host: u32) u32 {
 
 fn sysWrite(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
-    const fd = sysv.arg(cpu, 0);
+    const gfd = sysv.arg(cpu, 0);
     const buf = sysv.arg(cpu, 1);
     const count = sysv.arg(cpu, 2);
-
-    // Bounds-check the guest buffer, then write from the backing store.
+    const hfd = hostFd(runner, gfd) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
     if (@as(u64, buf) + count > mem.Memory.size) {
         sysv.returnError(cpu, EFAULT);
         return true;
     }
     const slice = runner.memory.bytes[buf .. buf + count];
-    const n = write(@intCast(fd), slice.ptr, slice.len);
+    const n = write(hfd, slice.ptr, slice.len);
     if (n < 0) {
         sysv.returnError(cpu, mapErrno(hostErrno()));
     } else {
@@ -153,16 +190,19 @@ fn sysWrite(runner: *machine.Runner) bool {
 
 fn sysRead(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
-    const fd = sysv.arg(cpu, 0);
+    const gfd = sysv.arg(cpu, 0);
     const buf = sysv.arg(cpu, 1);
     const count = sysv.arg(cpu, 2);
-
+    const hfd = hostFd(runner, gfd) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
     if (@as(u64, buf) + count > mem.Memory.size) {
         sysv.returnError(cpu, EFAULT);
         return true;
     }
     const slice = runner.memory.bytes[buf .. buf + count];
-    const n = read(@intCast(fd), slice.ptr, slice.len);
+    const n = read(hfd, slice.ptr, slice.len);
     if (n < 0) {
         sysv.returnError(cpu, mapErrno(hostErrno()));
     } else {
@@ -171,48 +211,169 @@ fn sysRead(runner: *machine.Runner) bool {
     return true;
 }
 
+// SysV/88 O_* open flags (from the guest's fcntl.h): O_RDONLY=0, O_WRONLY=1,
+// O_RDWR=2, O_CREAT=0x100, O_TRUNC=0x200, O_EXCL=0x400, O_APPEND=0x8. Host
+// (Linux) values differ; translate.
+const H_O_CREAT: c_int = 0o100;
+const H_O_TRUNC: c_int = 0o1000;
+const H_O_EXCL: c_int = 0o200;
+const H_O_APPEND: c_int = 0o2000;
+
+fn translateOpenFlags(guest: u32) c_int {
+    var h: c_int = @intCast(guest & 0x3); // RDONLY/WRONLY/RDWR line up 0/1/2
+    if (guest & 0x100 != 0) h |= H_O_CREAT;
+    if (guest & 0x200 != 0) h |= H_O_TRUNC;
+    if (guest & 0x400 != 0) h |= H_O_EXCL;
+    if (guest & 0x8 != 0) h |= H_O_APPEND;
+    return h;
+}
+
+fn readGuestPath(runner: *machine.Runner, ptr: u32, buf: []u8) ?[]const u8 {
+    const s = runner.memory.readCStr(ptr, buf[0 .. buf.len - 1]);
+    if (s.len >= buf.len - 1) return null;
+    buf[s.len] = 0;
+    return buf[0..s.len];
+}
+
 fn sysOpen(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const path_ptr = sysv.arg(cpu, 0);
     const flags = sysv.arg(cpu, 1);
     const mode = sysv.arg(cpu, 2);
 
-    var buf: [1024]u8 = undefined;
-    const path = runner.memory.readCStr(path_ptr, &buf);
-    if (path.len >= buf.len) {
+    var gbuf: [1024]u8 = undefined;
+    const gpath = readGuestPath(runner, path_ptr, &gbuf) orelse {
         sysv.returnError(cpu, EINVAL);
         return true;
+    };
+
+    // Resolve through the guest mount table when an fs is configured; else pass
+    // the path straight to the host (early-milestone behavior).
+    var hbuf: [2048]u8 = undefined;
+    var cpath: [*:0]const u8 = @ptrCast(gbuf[0 .. gpath.len + 1].ptr);
+    if (fsOf(runner)) |fs| {
+        const hp = fs.resolve(gpath, &hbuf) catch {
+            sysv.returnError(cpu, ENOENT);
+            return true;
+        };
+        cpath = hp.ptr;
     }
-    buf[path.len] = 0;
-    const cpath: [*:0]const u8 = @ptrCast(&buf);
-    const fd = open(cpath, @intCast(flags), @intCast(mode));
-    if (fd < 0) {
+
+    const hfd = open(cpath, translateOpenFlags(flags), @intCast(mode));
+    if (hfd < 0) {
         sysv.returnError(cpu, mapErrno(hostErrno()));
+        return true;
+    }
+    // Allocate a guest fd. With an fs, use its fd table (lowest-free); without,
+    // return the host fd directly. If the target is a directory, also open a
+    // dir stream so getdents can read it (the host forbids read(2) on dirs).
+    if (fsOf(runner)) |fs| {
+        if (fs.openDir(cpath, hfd)) |gdir| {
+            sysv.returnSuccess(cpu, gdir);
+            return true;
+        }
+        const gfd = fs.allocFd(hfd) orelse {
+            _ = close(hfd);
+            sysv.returnError(cpu, EBADF);
+            return true;
+        };
+        sysv.returnSuccess(cpu, gfd);
     } else {
-        sysv.returnSuccess(cpu, @intCast(fd));
+        sysv.returnSuccess(cpu, @intCast(hfd));
     }
     return true;
 }
 
+/// Map a guest fd to a host fd. With an fs, go through the fd table; without,
+/// the guest fd IS the host fd.
+fn hostFd(runner: *machine.Runner, gfd: u32) ?c_int {
+    if (fsOf(runner)) |fs| {
+        const h = fs.get(gfd) orelse return null;
+        return @intCast(h);
+    }
+    return @intCast(gfd);
+}
+
 fn sysClose(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
-    const fd = sysv.arg(cpu, 0);
-    // Don't let the guest close our host stdio.
-    if (fd <= 2) {
+    const gfd = sysv.arg(cpu, 0);
+    if (fsOf(runner)) |fs| {
+        if (fs.closeFd(gfd)) sysv.returnSuccess(cpu, 0) else sysv.returnError(cpu, EBADF);
+        return true;
+    }
+    if (gfd <= 2) {
         sysv.returnSuccess(cpu, 0);
         return true;
     }
-    const rc = close(@intCast(fd));
+    const rc = close(@intCast(gfd));
     if (rc < 0) sysv.returnError(cpu, mapErrno(hostErrno())) else sysv.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysAccess(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const path_ptr = sysv.arg(cpu, 0);
+    const amode = sysv.arg(cpu, 1);
+    var gbuf: [1024]u8 = undefined;
+    const gpath = readGuestPath(runner, path_ptr, &gbuf) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    var hbuf: [2048]u8 = undefined;
+    var cpath: [*:0]const u8 = @ptrCast(gbuf[0 .. gpath.len + 1].ptr);
+    if (fsOf(runner)) |fs| {
+        const hp = fs.resolve(gpath, &hbuf) catch {
+            sysv.returnError(cpu, ENOENT);
+            return true;
+        };
+        cpath = hp.ptr;
+    }
+    if (fsmod.c.access(cpath, @intCast(amode)) < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+    } else {
+        sysv.returnSuccess(cpu, 0);
+    }
+    return true;
+}
+
+fn sysChdir(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const path_ptr = sysv.arg(cpu, 0);
+    var gbuf: [1024]u8 = undefined;
+    const gpath = readGuestPath(runner, path_ptr, &gbuf) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    if (fsOf(runner)) |fs| {
+        // Verify the target exists (resolve + access) before committing cwd.
+        var hbuf: [2048]u8 = undefined;
+        const hp = fs.resolve(gpath, &hbuf) catch {
+            sysv.returnError(cpu, ENOENT);
+            return true;
+        };
+        if (fsmod.c.access(hp, 0) < 0) {
+            sysv.returnError(cpu, ENOENT);
+            return true;
+        }
+        fs.chdir(gpath) catch {
+            sysv.returnError(cpu, EINVAL);
+            return true;
+        };
+    }
+    sysv.returnSuccess(cpu, 0);
     return true;
 }
 
 fn sysLseek(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
-    const fd = sysv.arg(cpu, 0);
+    const gfd = sysv.arg(cpu, 0);
     const off = sysv.arg(cpu, 1);
     const whence = sysv.arg(cpu, 2);
-    const pos = lseek(@intCast(fd), @as(c_long, @intCast(@as(i32, @bitCast(off)))), @intCast(whence));
+    const fd = hostFd(runner, gfd) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
+    const pos = lseek(fd, @as(c_long, @intCast(@as(i32, @bitCast(off)))), @intCast(whence));
     if (pos < 0) sysv.returnError(cpu, mapErrno(hostErrno())) else sysv.returnSuccess(cpu, @intCast(pos & 0xffff_ffff));
     return true;
 }
@@ -224,8 +385,14 @@ fn sysBrk(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const newbrk = sysv.arg(cpu, 0);
 
-    if (newbrk < runner.brk_base or newbrk >= 0x0B00_0000) {
+    if (newbrk >= 0x0B00_0000) {
         sysv.returnError(cpu, ENOMEM);
+        return true;
+    }
+    // A break below the heap base is a no-op success (some sbrk wrappers probe
+    // with a small value to read the current break); don't fail malloc.
+    if (newbrk < runner.brk_base) {
+        sysv.returnSuccess(cpu, 0);
         return true;
     }
     if (newbrk > runner.brk) {
@@ -256,6 +423,35 @@ fn sysBrk(runner: *machine.Runner) bool {
 // total size 32.
 const STAT_SIZE: u32 = 32;
 
+// SysV/88 R4.0 NEW `struct stat` (user-level 4.0, maps to kernel xstat), used
+// by the versioned calls lstat(88)/xstat(123)/lxstat(124)/fxstat(125). All
+// leading fields are 32-bit, 4-byte aligned:
+//   st_dev@0 st_ino@4 st_mode@8 st_nlink@12 st_uid@16 st_gid@20 st_rdev@24
+//   st_size@28 st_atime@32 st_ausec@36 st_mtime@40 st_musec@44 st_ctime@48
+//   st_cusec@52 st_atim@56(8) st_mtim@64(8) st_ctim@72(8) st_blksize@80
+//   st_blocks@84 st_fstype[16]@88 st_pading[408]@104 => total 512.
+const STAT_NEW_SIZE: u32 = 512;
+
+fn writeGuestStatNew(memory: *mem.Memory, addr: u32, hs: *const HostStat) void {
+    memory.zero(addr, STAT_NEW_SIZE);
+    memory.write32(addr + 0, hs.dev);
+    memory.write32(addr + 4, hs.ino);
+    memory.write32(addr + 8, hs.mode); // full 32-bit mode (S_IF* bits match host)
+    memory.write32(addr + 12, hs.nlink);
+    memory.write32(addr + 16, hs.uid);
+    memory.write32(addr + 20, hs.gid);
+    memory.write32(addr + 24, hs.rdev);
+    memory.write32(addr + 28, @truncate(hs.size));
+    memory.write32(addr + 32, @bitCast(@as(i32, @truncate(hs.atime))));
+    memory.write32(addr + 40, @bitCast(@as(i32, @truncate(hs.mtime))));
+    memory.write32(addr + 48, @bitCast(@as(i32, @truncate(hs.ctime))));
+    memory.write32(addr + 56, @bitCast(@as(i32, @truncate(hs.atime)))); // st_atim.tv_sec
+    memory.write32(addr + 64, @bitCast(@as(i32, @truncate(hs.mtime)))); // st_mtim.tv_sec
+    memory.write32(addr + 72, @bitCast(@as(i32, @truncate(hs.ctime)))); // st_ctim.tv_sec
+    memory.write32(addr + 80, 4096); // st_blksize
+    memory.write32(addr + 84, @intCast((hs.size + 511) / 512)); // st_blocks
+}
+
 fn writeGuestStat(memory: *mem.Memory, addr: u32, hs: *const HostStat) void {
     // Guest S_IF* file-type bits (S_IFCHR=0x2000, S_IFREG=0x8000, ...) match
     // the host's standard values, so the file-type field of st_mode carries
@@ -278,63 +474,228 @@ fn writeGuestStat(memory: *mem.Memory, addr: u32, hs: *const HostStat) void {
 
 fn sysFstat(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
-    const fd = sysv.arg(cpu, 0);
+    const gfd = sysv.arg(cpu, 0);
     const statbuf = sysv.arg(cpu, 1);
-    if (@as(u64, statbuf) + STAT_SIZE > mem.Memory.size) {
+    const fd = hostFd(runner, gfd) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
+    if (@as(u64, statbuf) + STAT_NEW_SIZE > mem.Memory.size) {
         sysv.returnError(cpu, EFAULT);
         return true;
     }
     var hs: HostStat = undefined;
-    r88k_fstat(@intCast(fd), &hs);
+    r88k_fstat(fd, &hs);
     if (hs.ok == 0) {
         sysv.returnError(cpu, mapErrno(@intCast(hs.err)));
         return true;
     }
     const was = runner.memory.enforce;
     runner.memory.enforce = false;
-    writeGuestStat(runner.memory, statbuf, &hs);
+    // fstat(28) on this R4.0 userland uses the NEW (xstat-style) struct, same
+    // as lstat(88); the old 32-byte struct is only for the pre-4.0 stat form.
+    writeGuestStatNew(runner.memory, statbuf, &hs);
     runner.memory.enforce = was;
     sysv.returnSuccess(cpu, 0);
     return true;
 }
 
+// On this R4.0 userland stat(18)/fstat(28)/lstat(88) all use the NEW
+// (xstat-style) struct. stat follows symlinks, lstat does not.
 fn sysStat(runner: *machine.Runner) bool {
+    return sysStatImpl(runner, false, true);
+}
+fn sysLstat(runner: *machine.Runner) bool {
+    return sysStatImpl(runner, true, true);
+}
+
+fn sysStatImpl(runner: *machine.Runner, is_lstat: bool, new_layout: bool) bool {
     const cpu = &runner.cpu;
     const path_ptr = sysv.arg(cpu, 0);
     const statbuf = sysv.arg(cpu, 1);
-    var pbuf: [1024]u8 = undefined;
-    const path = runner.memory.readCStr(path_ptr, &pbuf);
-    if (path.len >= pbuf.len or @as(u64, statbuf) + STAT_SIZE > mem.Memory.size) {
+    var gbuf: [1024]u8 = undefined;
+    const gpath = readGuestPath(runner, path_ptr, &gbuf) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    const need: u32 = if (new_layout) STAT_NEW_SIZE else STAT_SIZE;
+    if (@as(u64, statbuf) + need > mem.Memory.size) {
         sysv.returnError(cpu, EFAULT);
         return true;
     }
-    pbuf[path.len] = 0;
+    var hbuf: [2048]u8 = undefined;
+    var cpath: [*:0]const u8 = @ptrCast(gbuf[0 .. gpath.len + 1].ptr);
+    if (fsOf(runner)) |fs| {
+        const hp = fs.resolve(gpath, &hbuf) catch {
+            sysv.returnError(cpu, ENOENT);
+            return true;
+        };
+        cpath = hp.ptr;
+    }
     var hs: HostStat = undefined;
-    r88k_stat(@ptrCast(&pbuf), &hs);
+    if (is_lstat) r88k_lstat(cpath, &hs) else r88k_stat(cpath, &hs);
     if (hs.ok == 0) {
         sysv.returnError(cpu, mapErrno(@intCast(hs.err)));
         return true;
     }
     const was = runner.memory.enforce;
     runner.memory.enforce = false;
-    writeGuestStat(runner.memory, statbuf, &hs);
+    if (new_layout) writeGuestStatNew(runner.memory, statbuf, &hs) else writeGuestStat(runner.memory, statbuf, &hs);
     runner.memory.enforce = was;
     sysv.returnSuccess(cpu, 0);
     return true;
 }
 
 extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
+extern "c" fn dup(fd: c_int) c_int;
+extern "c" fn time(t: ?*c_long) c_long;
+
+fn sysTime(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const t: u32 = @intCast(@as(i64, time(null)) & 0xffff_ffff);
+    // SysV time(2): optionally stores the result at the pointer in the first
+    // arg, and also returns it.
+    const tptr = sysv.arg(cpu, 0);
+    if (tptr != 0 and @as(u64, tptr) + 4 <= mem.Memory.size) {
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        runner.memory.write32(tptr, t);
+        runner.memory.enforce = was;
+    }
+    sysv.returnSuccess(cpu, t);
+    return true;
+}
+
+/// mmap: only anonymous, fixed-nothing allocations are supported (what libc
+/// malloc uses). Hand out zeroed, RW guest memory from a downward bump region.
+/// File-backed mmap is not yet supported.
+fn sysMmap(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    // SysV mmap(addr, len, prot, flags, fd, off) — args r2..r7.
+    const len = sysv.arg(cpu, 1);
+    const fd = sysv.arg(cpu, 4);
+    const MAP_ANON: u32 = 0x100; // guest flag; file-backed not supported yet
+    const flags = sysv.arg(cpu, 3);
+    if (fd != 0xffffffff and (flags & MAP_ANON) == 0) {
+        sysv.returnError(cpu, EINVAL); // file-backed mmap unsupported
+        return true;
+    }
+    const size = std.mem.alignForward(u32, if (len == 0) 1 else len, 0x1000);
+    if (runner.mmap_next < runner.brk + 0x10000 or runner.mmap_next -% size < runner.brk) {
+        sysv.returnError(cpu, ENOMEM);
+        return true;
+    }
+    const base = runner.mmap_next -% size;
+    runner.mmap_next = base;
+    const was = runner.memory.enforce;
+    runner.memory.enforce = false;
+    runner.memory.zero(base, size);
+    runner.memory.addRegion(base, size, .{ .read = true, .write = true }) catch {};
+    runner.memory.enforce = was;
+    sysv.returnSuccess(cpu, base);
+    return true;
+}
+
+// Directory-read shim (src/host_dir.c): opendir/readdir/closedir keyed by a
+// small handle table, since modern hosts forbid read(2) on directories.
+extern fn r88k_diropen(path: [*:0]const u8) c_int;
+extern fn r88k_dirread(handle: c_int, ino_out: *c_ulong, name_out: [*]u8) c_int;
+extern fn r88k_dirclose(handle: c_int) void;
+
+/// getdents(fd, buf, nbyte): fill buf with SVR4 `struct dirent`:
+///   ino_t d_ino (4) ; off_t d_off (4) ; unsigned short d_reclen (2) ;
+///   char d_name[] (NUL-terminated, then pad to align d_reclen to 4).
+/// Returns bytes written, or 0 at end of directory. Directories are opened
+/// lazily here by resolving the fd's guest path — but we don't track the path,
+/// so instead we open the directory stream when the guest fd was opened on a
+/// directory. For simplicity we (re)open by the host fd's path via /proc is not
+/// portable; instead we key a dir stream to the guest fd on first getdents by
+/// using the host fd with fdopendir-like behavior in the shim.
+fn sysGetdents(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gfd = sysv.arg(cpu, 0);
+    const buf = sysv.arg(cpu, 1);
+    const nbyte = sysv.arg(cpu, 2);
+    const fs = fsOf(runner) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
+    const handle = fs.dirHandleFor(gfd) orelse {
+        sysv.returnError(cpu, EBADF); // not a directory (or unopened)
+        return true;
+    };
+    if (@as(u64, buf) + nbyte > mem.Memory.size) {
+        sysv.returnError(cpu, EFAULT);
+        return true;
+    }
+    var written: u32 = 0;
+    const was = runner.memory.enforce;
+    runner.memory.enforce = false;
+    defer runner.memory.enforce = was;
+    while (true) {
+        var ino: c_ulong = 0;
+        var namebuf: [256]u8 = undefined;
+        const rc = r88k_dirread(handle, &ino, &namebuf);
+        if (rc <= 0) break; // end of directory
+        const name = std.mem.sliceTo(&namebuf, 0);
+        // reclen = header(10) + name + 1 (NUL), padded to 4.
+        const raw = 10 + name.len + 1;
+        const reclen: u32 = @intCast(std.mem.alignForward(usize, raw, 4));
+        if (written + reclen > nbyte) {
+            fs.dirPushback(handle); // didn't fit; re-emit next call
+            break;
+        }
+        const at = buf + written;
+        runner.memory.write32(at + 0, @intCast(ino & 0xffffffff)); // d_ino
+        runner.memory.write32(at + 4, written + reclen); // d_off (next offset)
+        runner.memory.write16(at + 8, @intCast(reclen)); // d_reclen
+        runner.memory.writeBytes(at + 10, name);
+        runner.memory.write8(at + 10 + @as(u32, @intCast(name.len)), 0);
+        written += reclen;
+    }
+    sysv.returnSuccess(cpu, written);
+    return true;
+}
+
+fn sysDup(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gfd = sysv.arg(cpu, 0);
+    const fd = hostFd(runner, gfd) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
+    const hnew = dup(fd);
+    if (hnew < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+        return true;
+    }
+    if (fsOf(runner)) |fs| {
+        const gnew = fs.allocFd(hnew) orelse {
+            _ = close(hnew);
+            sysv.returnError(cpu, EBADF);
+            return true;
+        };
+        sysv.returnSuccess(cpu, gnew);
+    } else {
+        sysv.returnSuccess(cpu, @intCast(hnew));
+    }
+    return true;
+}
 
 /// fcntl. SysV cmds: F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4.
 /// Pass DUPFD/GETFD/SETFD through to the host; treat the flag queries benignly.
 fn sysFcntl(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
-    const fd = sysv.arg(cpu, 0);
+    const gfd = sysv.arg(cpu, 0);
     const cmd = sysv.arg(cpu, 1);
     const arg3 = sysv.arg(cpu, 2);
+    const fd = hostFd(runner, gfd) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
     switch (cmd) {
         0, 1, 2 => { // F_DUPFD / F_GETFD / F_SETFD
-            const rc = fcntl(@intCast(fd), @intCast(cmd), @intCast(arg3));
+            const rc = fcntl(fd, @intCast(cmd), @intCast(arg3));
             if (rc < 0) sysv.returnError(cpu, mapErrno(hostErrno())) else sysv.returnSuccess(cpu, @intCast(rc));
         },
         3 => sysv.returnSuccess(cpu, 0), // F_GETFL: report no special flags

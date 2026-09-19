@@ -60,6 +60,16 @@ void r88k_stat(const char *path, struct r88k_stat *out) {
     }
 }
 
+void r88k_lstat(const char *path, struct r88k_stat *out) {
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        fill(out, &st);
+    } else {
+        out->ok = 0;
+        out->err = errno;
+    }
+}
+
 /* Portable S_IF* accessors so the Zig side can classify without hardcoding
  * host bit values (they happen to be standard, but be explicit). */
 unsigned int r88k_s_ifchr(void) { return S_IFCHR; }

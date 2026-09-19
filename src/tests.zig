@@ -12,4 +12,6 @@ test {
     _ = @import("syscalls/dispatch.zig");
     _ = @import("syscalls/table_sysv88.zig");
     _ = @import("difftrace.zig");
+    _ = @import("fs.zig");
+    _ = @import("loaders/dynamic.zig");
 }

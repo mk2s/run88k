@@ -55,6 +55,10 @@ pub const Runner = struct {
     syscall_vector: u32 = 0xffff_ffff,
     /// Installed syscall handler. If null, a syscall trap stops the loop.
     handler: ?SyscallFn = null,
+    /// Guest filesystem (mount table + fd table). Type-erased to avoid an
+    /// import cycle (fs is imported by the dispatcher, not by machine). The
+    /// dispatcher casts it back to *fs.Fs.
+    fs: ?*anyopaque = null,
 
     /// Set when the guest exits; holds the process exit status.
     exit_status: ?u32 = null,
@@ -66,6 +70,11 @@ pub const Runner = struct {
     brk: u32 = 0,
     /// Lowest legal break (initial brk); brk cannot go below this.
     brk_base: u32 = 0,
+    /// mmap bump pointer for anonymous allocations (grows down from a high
+    /// region, kept clear of the stack).
+    mmap_next: u32 = 0x0800_0000,
+    /// umask (tracked; applied host-side).
+    umask: u32 = 0,
     /// Instruction budget guard against a runaway guest.
     steps_run: u64 = 0,
 

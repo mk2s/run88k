@@ -21,107 +21,161 @@ pub const Error = error{
 
 pub const LoadedImage = struct {
     entry: u32,
-    /// Initial program break: end of the highest PT_LOAD, page-rounded up.
+    /// Initial program break: end of the highest PT_LOAD (unrounded).
     brk: u32,
     /// Lowest and highest mapped guest addresses (for diagnostics).
     load_low: u32,
     load_high: u32,
+    /// Guest vaddr of the PT_DYNAMIC segment (0 if none / static).
+    dynamic_vaddr: u32 = 0,
+    /// True if the executable requests an interpreter (PT_INTERP present) or
+    /// has a PT_DYNAMIC — i.e. it needs dynamic linking.
+    is_dynamic: bool = false,
 };
 
-const EI_NIDENT = 16;
-const ELFCLASS32 = 1;
-const ELFDATA2MSB = 2; // big-endian
-const ET_EXEC = 2;
-const EM_88K = 5; // EM_88K in the ELF machine enum (Motorola 88000)
-const PT_LOAD = 1;
-const PF_X = 1;
-const PF_W = 2;
-const PF_R = 4;
+/// A mapped ELF object (executable or shared library), with the metadata the
+/// dynamic linker needs. Segments are already loaded into guest memory.
+pub const MappedObject = struct {
+    /// Load bias applied to all vaddrs (0 for a fixed-address EXEC, else the
+    /// base where a relocatable object was placed).
+    bias: u32,
+    entry: u32, // biased entry point
+    dynamic_vaddr: u32, // biased PT_DYNAMIC address (0 if none)
+    load_low: u32,
+    load_high: u32,
+};
+
+pub const EI_NIDENT = 16;
+pub const ELFCLASS32 = 1;
+pub const ELFDATA2MSB = 2; // big-endian
+pub const ET_EXEC = 2;
+pub const ET_DYN = 3;
+pub const EM_88K = 5; // EM_88K in the ELF machine enum (Motorola 88000)
+pub const PT_LOAD = 1;
+pub const PT_DYNAMIC = 2;
+pub const PT_INTERP = 3;
+pub const PF_X = 1;
+pub const PF_W = 2;
+pub const PF_R = 4;
 const PAGE = 0x1000;
 
-fn rd16(b: []const u8, off: usize) u16 {
+pub fn rd16(b: []const u8, off: usize) u16 {
     return std.mem.readInt(u16, b[off..][0..2], .big);
 }
-fn rd32(b: []const u8, off: usize) u32 {
+pub fn rd32(b: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, b[off..][0..4], .big);
 }
 
-/// Load `image` (raw file bytes) into `memory`. Permission enforcement is
-/// disabled while writing and restored by the caller/run setup.
-pub fn load(memory: *mem.Memory, image: []const u8) Error!LoadedImage {
+/// Validate the ELF header for an m88k big-endian object. Returns nothing on
+/// success; the caller reads e_type etc. directly.
+pub fn checkHeader(image: []const u8) Error!void {
     if (image.len < EI_NIDENT + 36) return error.NotElf;
     if (!std.mem.eql(u8, image[0..4], "\x7fELF")) return error.NotElf;
     if (image[4] != ELFCLASS32) return error.NotElf32;
     if (image[5] != ELFDATA2MSB) return error.NotBigEndian;
+    if (rd16(image, 18) != EM_88K) return error.NotM88k;
+}
 
-    const e_type = rd16(image, 16);
-    const e_machine = rd16(image, 18);
+/// Map all PT_LOAD segments of `image` into guest memory at `bias` (added to
+/// each p_vaddr). Zero-fills bss tails and sets region permissions. Returns the
+/// mapped-object metadata (biased entry, dynamic vaddr, load extents).
+///
+/// Enforcement must be off (caller manages it). For a fixed EXEC pass bias=0;
+/// for a relocatable ET_DYN pass the chosen load base.
+pub fn mapSegments(memory: *mem.Memory, image: []const u8, bias: u32) Error!MappedObject {
+    try checkHeader(image);
     const e_entry = rd32(image, 24);
     const e_phoff = rd32(image, 28);
     const e_phentsize = rd16(image, 42);
     const e_phnum = rd16(image, 44);
-
-    if (e_type != ET_EXEC) return error.NotExecutable;
-    if (e_machine != EM_88K) return error.NotM88k;
     if (e_phnum == 0 or e_phentsize < 32) return error.BadProgramHeaders;
-
-    const was_enforce = memory.enforce;
-    memory.enforce = false;
-    defer memory.enforce = was_enforce;
 
     var load_low: u32 = 0xffff_ffff;
     var load_high: u32 = 0;
+    var dyn_vaddr: u32 = 0;
 
     var i: usize = 0;
     while (i < e_phnum) : (i += 1) {
         const ph = e_phoff + i * e_phentsize;
         if (ph + 32 > image.len) return error.BadProgramHeaders;
-
         const p_type = rd32(image, ph + 0);
-        if (p_type != PT_LOAD) continue;
-
         const p_offset = rd32(image, ph + 4);
-        const p_vaddr = rd32(image, ph + 8);
+        const p_vaddr = rd32(image, ph + 8) +% bias;
         const p_filesz = rd32(image, ph + 16);
         const p_memsz = rd32(image, ph + 20);
         const p_flags = rd32(image, ph + 24);
 
-        // Range checks against guest memory and the source image.
+        if (p_type == PT_DYNAMIC) dyn_vaddr = p_vaddr;
+        if (p_type != PT_LOAD) continue;
+
         const seg_end = p_vaddr +% p_memsz;
         if (seg_end < p_vaddr or seg_end > mem.Memory.size) return error.LoadOutOfRange;
         if (p_filesz > p_memsz) return error.BadProgramHeaders;
         if (@as(u64, p_offset) + p_filesz > image.len) return error.BadProgramHeaders;
 
-        // Copy file-backed bytes, then zero the bss tail.
-        if (p_filesz > 0) {
-            memory.writeBytes(p_vaddr, image[p_offset .. p_offset + p_filesz]);
-        }
-        if (p_memsz > p_filesz) {
-            memory.zero(p_vaddr + p_filesz, p_memsz - p_filesz);
-        }
+        if (p_filesz > 0) memory.writeBytes(p_vaddr, image[p_offset .. p_offset + p_filesz]);
+        if (p_memsz > p_filesz) memory.zero(p_vaddr + p_filesz, p_memsz - p_filesz);
 
-        // Permission region for this segment.
+        // Shared libraries need their data (GOT) written during relocation and
+        // .plt patched; map text writable too so we can relocate freely. (We
+        // don't enforce W^X for the guest.)
         memory.addRegion(p_vaddr, p_memsz, .{
             .read = (p_flags & PF_R) != 0,
-            .write = (p_flags & PF_W) != 0,
+            .write = true,
             .exec = (p_flags & PF_X) != 0,
         }) catch return error.LoadOutOfRange;
 
         if (p_vaddr < load_low) load_low = p_vaddr;
         if (seg_end > load_high) load_high = seg_end;
     }
-
     if (load_high == 0) return error.BadProgramHeaders;
 
-    // The initial program break is the EXACT end of the highest loaded segment,
-    // NOT page-rounded: the guest's crt/libc treats that address as the initial
-    // break and grows the heap from there via brk(). Page-rounding would leave
-    // the gap [load_high, rounded) unmapped, and the guest writes into it.
     return .{
-        .entry = e_entry,
-        .brk = load_high,
+        .bias = bias,
+        .entry = e_entry +% bias,
+        .dynamic_vaddr = dyn_vaddr,
         .load_low = load_low,
         .load_high = load_high,
+    };
+}
+
+/// Load `image` (raw file bytes) into `memory`. Permission enforcement is
+/// disabled while writing and restored by the caller/run setup.
+pub fn load(memory: *mem.Memory, image: []const u8) Error!LoadedImage {
+    try checkHeader(image);
+    const e_type = rd16(image, 16);
+    if (e_type != ET_EXEC and e_type != ET_DYN) return error.NotExecutable;
+
+    const was_enforce = memory.enforce;
+    memory.enforce = false;
+    defer memory.enforce = was_enforce;
+
+    // Executables are fixed-address (bias 0). We only load the main object
+    // here; the dynamic linker (dynamic.zig) loads NEEDED libraries and applies
+    // relocations when is_dynamic is set.
+    const obj = try mapSegments(memory, image, 0);
+
+    // Detect dynamic linking: presence of PT_INTERP or PT_DYNAMIC.
+    var is_dyn = obj.dynamic_vaddr != 0;
+    const e_phoff = rd32(image, 28);
+    const e_phentsize = rd16(image, 42);
+    const e_phnum = rd16(image, 44);
+    var i: usize = 0;
+    while (i < e_phnum) : (i += 1) {
+        const ph = e_phoff + i * e_phentsize;
+        if (ph + 4 > image.len) break;
+        if (rd32(image, ph + 0) == PT_INTERP) is_dyn = true;
+    }
+
+    // The initial program break is the EXACT end of the highest loaded segment,
+    // NOT page-rounded (the guest's crt/libc grows the heap from there).
+    return .{
+        .entry = obj.entry,
+        .brk = obj.load_high,
+        .load_low = obj.load_low,
+        .load_high = obj.load_high,
+        .dynamic_vaddr = obj.dynamic_vaddr,
+        .is_dynamic = is_dyn,
     };
 }
 
