@@ -23,6 +23,14 @@ const fsmod = @import("../fs.zig");
 
 const rd32 = elf.rd32;
 
+const DBG = false;
+fn dbgPreempt(name: []const u8, slot: u32, old: u32, new: u32) void {
+    _ = name;
+    _ = slot;
+    _ = old;
+    _ = new;
+}
+
 pub const Error = error{
     NotElf,
     NotElf32,
@@ -302,6 +310,65 @@ pub const Linker = struct {
         self.memory.write32(first + 0, head);
     }
 
+    /// Find a library's exported DATA symbol whose (unbiased) st_value equals
+    /// `vaddr`; return its name length written to `out`, or null.
+    fn dataSymAtValue(self: *Linker, obj: *const Object, vaddr: u32, out: []u8) ?usize {
+        if (obj.symtab == 0 or obj.nchain == 0) return null;
+        var si: u32 = 1;
+        while (si < obj.nchain) : (si += 1) {
+            const sym = obj.symtab + si * SYMENT;
+            const st_value = self.memory.read32(sym + 4);
+            const st_shndx = self.memory.read16(sym + 14);
+            if (st_shndx == SHN_UNDEF) continue;
+            if (st_value != vaddr) continue;
+            const st_name = self.memory.read32(sym + 0);
+            if (st_name == 0) continue;
+            return self.copyName(obj, st_name, out);
+        }
+        return null;
+    }
+
+    /// Look up a symbol defined by the EXECUTABLE (obj 0) only.
+    fn exeDefines(self: *Linker, name: []const u8) ?u32 {
+        const exe = &self.objs[0];
+        if (exe.symtab == 0 or exe.nchain == 0) return null;
+        var si: u32 = 1;
+        while (si < exe.nchain) : (si += 1) {
+            const sym = exe.symtab + si * SYMENT;
+            const st_shndx = self.memory.read16(sym + 14);
+            const st_name = self.memory.read32(sym + 0);
+            if (st_shndx == SHN_UNDEF or st_name == 0) continue;
+            if (self.symNameEq(exe, st_name, name)) return self.memory.read32(sym + 4); // exe bias is 0
+        }
+        return null;
+    }
+
+    /// See the pass-3 comment in link(). For each library, redirect GOT slots
+    /// whose RELATIVE reloc targets a symbol the executable also defines.
+    fn preemptLibraryData(self: *Linker) void {
+        var oi: usize = 1; // libraries only
+        while (oi < self.n_objs) : (oi += 1) {
+            const obj = &self.objs[oi];
+            if (obj.rela == 0 or obj.relasz == 0) continue;
+            var off: u32 = 0;
+            while (off < obj.relasz) : (off += 12) {
+                const r_info = self.memory.read32(obj.rela + off + 4);
+                if ((r_info & 0xff) != R_88K_RELATIVE) continue;
+                const slot = self.memory.read32(obj.rela + off + 0) +% obj.bias;
+                // The slot now holds (unbiased target + bias) after pass 2.
+                const cur = self.memory.read32(slot);
+                if (cur < obj.bias) continue;
+                const unbiased = cur -% obj.bias;
+                var namebuf: [128]u8 = undefined;
+                const nlen = self.dataSymAtValue(obj, unbiased, &namebuf) orelse continue;
+                if (self.exeDefines(namebuf[0..nlen])) |exe_addr| {
+                    self.memory.write32(slot, exe_addr);
+                    if (DBG) dbgPreempt(namebuf[0..nlen], slot, cur, exe_addr);
+                }
+            }
+        }
+    }
+
     fn copyName(self: *Linker, obj: *const Object, name_off: u32, out: []u8) usize {
         var i: usize = 0;
         while (i < out.len) : (i += 1) {
@@ -389,6 +456,15 @@ pub fn link(
         if (oi != 0 and obj.rela != 0 and obj.relasz != 0) try lk.applyRela(obj, obj.rela, obj.relasz);
         if (obj.jmprel != 0 and obj.pltrelsz != 0) try lk.applyRela(obj, obj.jmprel, obj.pltrelsz);
     }
+
+    // Pass 3: preempt library data references. A library GOT slot filled by a
+    // (nameless) RELATIVE reloc that targets one of the library's OWN exported
+    // data symbols must instead point at the EXECUTABLE's definition, if the
+    // exe exports the same symbol (ELF symbol preemption). Covers plain
+    // exported globals like optind/opterr that getopt reads: date defines them,
+    // so libc's getopt must use date's copies. We correlate the reloc's target
+    // vaddr to a library symbol's st_value, then look the name up in the exe.
+    lk.preemptLibraryData();
 
     // Build the runtime-linker link_map chain and publish it where libc's
     // startup expects it. The SysV/88 shared libc (which is also the

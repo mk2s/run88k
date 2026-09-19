@@ -55,20 +55,45 @@ linker responsibilities beyond relocation were required and are implemented:
 Also: `brk` below the heap base is a success no-op (sbrk probes), and the mmap
 bump-region is kept clear of the library load area.
 
-## Remaining: `date` exits early (no output) — a startup/init detail
+## Symbol preemption for library GOT slots (RELATIVE relocs) — DONE
 
-date now runs cleanly to `exit(0)` but produces no output. Tracing shows it
-exits after only ~6413 instructions and NEVER reaches `localtime`, `strftime`,
-or `puts` — so it is bailing during crt/libc initialization, before doing any
-date work. This is a startup-contract issue specific to dynamic executables
-(the dynamic crt likely expects additional linker-provided state — e.g. the
-`_DYNAMIC`/`r_debug` handshake, an auxv, or a specific initial register/stack
-setup for the interpreted-executable case) rather than a relocation problem.
-The 3× `time(0, &buf)` calls during startup point at libc's tzset/locale init.
+The final general piece: a library's GOT slot filled by a nameless RELATIVE
+reloc that targets one of the library's OWN exported data symbols must be
+redirected to the EXECUTABLE's definition when the exe also exports that symbol
+(ELF symbol preemption). `preemptLibraryData()` correlates each library
+RELATIVE reloc's target vaddr to a library `.dynsym` symbol, and if the exe
+defines the same name, overwrites the GOT slot with the exe's address.
 
-This is the next thread to pull for full dynamic-binary support (and the
-toolchain). The dynamic *linking* itself — load, relocate, symbol resolution,
-link_map, break setup — is done and correct; static binaries are unaffected.
+This fixed `getopt`: date defines `optind`/`optarg`/`optopt`, and libc's getopt
+reads them via GOT slots that RELATIVE-relocated to libc's own copies. After
+preemption, libc's getopt uses date's `optind` (=1), and `getopt` correctly
+returns -1 for no-args (was returning 1 → wrong branch). Also preempts `__iob`,
+`tzname`, `daylight`, `_lib_version`, etc.
+
+## Where dynamic linking stands
+
+Fully implemented and correct: segment mapping with bias, NEEDED-lib loading,
+RELATIVE/JMP_SLOT/COPY/generic relocations, cross-object symbol resolution,
+COPY-reloc + RELATIVE-GOT symbol preemption, the `struct link_map` chain
+(`__first_link`), and the `_nd` break global. date now runs its entire crt +
+libc startup, `setlocale`/`setcat`/`setlabel`/`time`/`getopt` all execute,
+getopt returns correctly, and stdout is set up (fstat/ioctl on fd 1). Static
+binaries are unaffected.
+
+## Remaining (narrow): `date` produces no visible output
+
+date runs its whole startup, does `time`/`fstat(1)`/`ioctl(1, TCGETA)`, then
+`exit(0)` — with no `write`. It reaches main and the post-getopt path, sets up
+stdout, but the formatted date is never written. Candidates:
+  - `strftime`/`localtime` returns an empty result (timezone/locale data not
+    found — date reads /etc/TIMEZONE or TZ; localtime calls `time` repeatedly
+    during tzset). Needs tracing localtime/strftime output.
+  - the output is buffered in stdio and the exit-time fflush doesn't emit it
+    (the link_map walk works now, but the FILE's buffer/state may be wrong).
+This is date-specific application/stdio behavior, not a linking defect — the
+dynamic linker and startup contract are complete. Next: trace inside
+localtime/strftime to see whether the date string is produced, and whether the
+stdout FILE buffers correctly.
 
 ## (historical) Diagnosis notes — COPY-relocation symbol preemption
 
