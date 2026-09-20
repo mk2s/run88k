@@ -52,14 +52,47 @@ the trace for the divergent instruction, confirmed against the nono oracle.
 - **uname (135)** — fills a SVR4 `struct utsname` (five 257-byte fields:
   sysname/nodename/release/version/machine) with plausible SysV/88 values.
 
-## Still to do (follow-ups)
-- **`;` sequencing** and **pipelines** fault after the first child: e.g.
-  `sh -c "/usr/bin/pwd; /usr/bin/true"` runs pwd then the parent faults at
-  0x312c0; `pwd | cat` faults in cat. Likely post-fork parent/child state or
-  fd-inheritance issues in the host-fork model — needs investigation.
-- Individual external programs may hit further unimplemented syscalls
-  (fail-fast reports them, e.g. it surfaced uname(135) cleanly).
+## Sequencing, pipelines, and `#!` scripts — WORKING
 
-The process-model plumbing (fork/exec/wait/waitsys/pipe) is wired and works for
-single-command `-c`; static single-process binaries (echo/cat/ls/pwd) are
-unaffected and work.
+All of these now run end-to-end (verified against `/sbin/sh`):
+
+- `sh -c "/usr/bin/pwd; /usr/bin/uname"` — sequencing (`;`)
+- `sh -c "/usr/bin/pwd | /usr/bin/cat"` and 3-stage `pwd | cat | cat` — pipelines
+- `sh -c "echo hello | /usr/bin/cat"` — builtin piped into an external
+- `sh -c "/usr/bin/true && echo yes"` / `"/usr/bin/false || echo fallback"` —
+  `&&`/`||` (validates exit-status propagation through waitsys)
+- `sh -c "pwd"` — PATH resolution to `/usr/bin/pwd`
+- `sh -c "/usr/bin/true; echo done"` — `#!/sbin/sh` script via execve
+
+### Two fixes made
+1. **Pipeline fd redirection — `fcntl(F_DUPFD)` returned a host fd.**
+   Shells build their stdio wiring with `close(1); fcntl(pipe_wr, F_DUPFD, 1)`,
+   expecting the result to be a *guest* fd (an index into the guest fd table)
+   at or above the given floor. Our handler passed F_DUPFD straight to host
+   `fcntl`, returning a raw host fd number that the guest then treated as a
+   guest fd — corrupting its fd bookkeeping after fork/exec, so the downstream
+   `cat` couldn't read the pipe. Fixed: F_DUPFD now `dup()`s the host fd and
+   registers it via a new `Fs.allocFdFrom(hfd, floor)` (lowest free guest fd
+   >= floor), returning the guest fd. F_GETFD/F_SETFD still pass through.
+   The guest fd table survives execve (doExec does not reset `self.fs`), so the
+   redirection carries into the exec'd program as Unix requires.
+
+2. **`#!interpreter [arg]` scripts in execve.** `/usr/bin/true` (and much of the
+   userland, incl. cc wrappers) are `#!/sbin/sh` scripts, not ELF. execve now
+   detects a leading `#!`, parses `interp [single-arg]`, and re-execs the
+   interpreter with argv rebuilt as `[interp, arg?, scriptpath, orig_argv[1..]]`,
+   bounded to 4 chained interpreters. Non-`#!` non-ELF files still fail cleanly.
+
+### Regression guards
+- `Fs.allocFdFrom` floor behavior unit-tested in `src/fs.zig`.
+- Statics (echo/cat/ls/pwd) and dynamic `date` unaffected; full `zig build test`
+  green.
+
+The process-model plumbing (fork/exec/wait/waitsys/pipe + F_DUPFD redirection +
+`#!` scripts) is complete for `-c` command lines with sequencing, pipelines, and
+conditionals.
+
+## Known remaining
+- Individual external programs may still hit unimplemented syscalls; the
+  fail-fast dispatcher reports them by number/name (that is how uname(135) and
+  waitsys(107) were surfaced).

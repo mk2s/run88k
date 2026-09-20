@@ -43,6 +43,12 @@ pub fn arg(cpu: *const Cpu, n: u5) u32 {
     return cpu.getReg(reg);
 }
 
+/// Overwrite a syscall argument register. Used to re-shape one syscall's args
+/// into another's convention (e.g. creat -> open) before delegating.
+pub fn setArg(cpu: *Cpu, n: u5, value: u32) void {
+    cpu.setReg(R_ARG0 + n, value);
+}
+
 /// Write a success return value into r2 and clear the carry (success), then
 /// advance PC past the error branch to the `jmp r1`.
 pub fn returnSuccess(cpu: *Cpu, value: u32) void {

@@ -69,6 +69,7 @@ const R_88K_RELATIVE = 16;
 // st_shndx(2) = 16 bytes.
 const SYMENT = 16;
 const SHN_UNDEF = 0;
+const SHN_ABS = 0xfff1;
 
 /// One loaded object (main exe or a shared lib).
 const Object = struct {
@@ -186,6 +187,11 @@ pub const Linker = struct {
                 if (st_shndx == SHN_UNDEF) continue; // undefined here
                 if (st_name == 0) continue;
                 if (self.symNameEq(obj, st_name, name)) {
+                    // SHN_ABS (0xfff1) symbols carry an absolute value that must
+                    // NOT be biased. Linker-defined markers like _end/_edata/
+                    // _etext in the executable are ABS; adding the object bias
+                    // corrupts them.
+                    if (st_shndx == SHN_ABS) return st_value;
                     return st_value +% obj.bias;
                 }
             }

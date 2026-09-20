@@ -23,6 +23,10 @@ pub const c = struct {
     pub extern "c" fn close(fd: c_int) c_int;
     pub extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
     pub extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+    pub extern "c" fn unlink(path: [*:0]const u8) c_int;
+    pub extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+    pub extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+    pub extern "c" fn rmdir(path: [*:0]const u8) c_int;
 };
 
 // Directory-stream shim (src/host_dir.c).
@@ -274,7 +278,14 @@ pub const Fs = struct {
     // --- fd table (lowest-free-first, like Unix) ---------------------------
 
     pub fn allocFd(self: *Fs, hfd: i32) ?u32 {
-        var i: usize = 0;
+        return self.allocFdFrom(hfd, 0);
+    }
+
+    /// Allocate the lowest free guest fd >= `min` and map it to host fd `hfd`.
+    /// This is the F_DUPFD contract (dup into a fd at or above a floor), which
+    /// shells use to build their stdio redirections.
+    pub fn allocFdFrom(self: *Fs, hfd: i32, min: u32) ?u32 {
+        var i: usize = min;
         while (i < MAX_FD) : (i += 1) {
             if (self.host_fd[i] < 0) {
                 self.host_fd[i] = hfd;
@@ -398,4 +409,18 @@ test "fd table lowest-free-first" {
     fs.host_fd[3] = -1;
     _ = fs.closeFd(1);
     try std.testing.expectEqual(@as(u32, 1), fs.allocFd(77).?);
+}
+
+test "allocFdFrom honors a floor (F_DUPFD contract)" {
+    var fs = try testFs();
+    defer fs.deinit();
+    // fds 0,1,2 are open by default. Duplicating with a floor of 5 must skip
+    // to fd 5 even though 3 and 4 are free — this is what a shell relies on
+    // when it moves a pipe end above the stdio range.
+    try std.testing.expectEqual(@as(u32, 5), fs.allocFdFrom(88, 5).?);
+    // The lowest-free path (floor 0) still fills the gap at 3 first.
+    try std.testing.expectEqual(@as(u32, 3), fs.allocFdFrom(89, 0).?);
+    // After closing stdout, a floor of 1 reuses fd 1 (the dup2(x,1) case).
+    _ = fs.closeFd(1);
+    try std.testing.expectEqual(@as(u32, 1), fs.allocFdFrom(90, 1).?);
 }

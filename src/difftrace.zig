@@ -142,7 +142,10 @@ pub fn run(
         const in_win = pc >= win_lo and pc < win_hi;
         if (in_win) {
             const op = memory.read32(pc);
-            const maddr = memOperand(cpu, op);
+            // Report the containing ALIGNED word so byte/half ops don't show a
+            // misleading unaligned window (which previously masqueraded as a
+            // store landing at the wrong offset).
+            const maddr = if (memOperand(cpu, op)) |a| a & ~@as(u32, 3) else null;
             const mpre: u32 = if (maddr) |a| (if (@as(u64, a) + 4 <= mem.Memory.size) memory.read32(a) else 0) else 0;
 
             // pre-state

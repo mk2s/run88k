@@ -93,12 +93,33 @@ pub const HostProcess = struct {
         argv: []const []const u8,
         envp: []const []const u8,
     ) ProcError!void {
+        try self.doExecDepth(path, argv, envp, 0);
+    }
+
+    /// Maximum `#!` interpreter chains to follow before giving up (matches the
+    /// kernel's guard against interpreter loops).
+    const max_shebang_depth: u32 = 4;
+
+    fn doExecDepth(
+        self: *HostProcess,
+        path: []const u8,
+        argv: []const []const u8,
+        envp: []const []const u8,
+        depth: u32,
+    ) ProcError!void {
         // Resolve + read the executable.
         var hbuf: [2048]u8 = undefined;
         const hpath = self.fs.resolve(path, &hbuf) catch return error.ExecFailed;
         const image = std.Io.Dir.cwd().readFileAlloc(self.io, hpath, self.gpa, .limited(64 * 1024 * 1024)) catch
             return error.ExecFailed;
         defer self.gpa.free(image);
+
+        // `#!interp [arg]` scripts: re-exec the interpreter with the script
+        // path spliced into argv, like the kernel does. Bounded to avoid loops.
+        if (image.len >= 2 and image[0] == '#' and image[1] == '!') {
+            if (depth >= max_shebang_depth) return error.ExecFailed;
+            return self.execShebang(image, path, argv, envp, depth);
+        }
 
         // Validate before clobbering memory.
         elf.checkHeader(image) catch return error.ExecFailed;
@@ -126,6 +147,74 @@ pub const HostProcess = struct {
 
         self.new_brk = img.brk;
         self.exec_entry = img.entry;
+    }
+
+    /// Handle a `#!interpreter [arg]` script: parse the first line, then re-exec
+    /// the interpreter with argv rebuilt as
+    ///   [interp, (optional single arg), scriptpath, orig_argv[1..]]
+    /// The kernel passes exactly one optional argument (everything after the
+    /// interpreter path up to end-of-line is a single token in SysV).
+    fn execShebang(
+        self: *HostProcess,
+        image: []const u8,
+        script_path: []const u8,
+        argv: []const []const u8,
+        envp: []const []const u8,
+        depth: u32,
+    ) ProcError!void {
+        // Extract the shebang line (after "#!", up to newline), stripped.
+        const nl = std.mem.indexOfScalar(u8, image, '\n') orelse image.len;
+        var line = image[2..nl];
+        // Trim leading blanks.
+        while (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) line = line[1..];
+        // Trim trailing blanks/CR.
+        while (line.len > 0 and (line[line.len - 1] == ' ' or line[line.len - 1] == '\t' or line[line.len - 1] == '\r'))
+            line = line[0 .. line.len - 1];
+        if (line.len == 0) return error.ExecFailed;
+
+        // Split into interpreter path and (at most one) argument.
+        const sp = std.mem.indexOfAny(u8, line, " \t");
+        const interp = if (sp) |i| line[0..i] else line;
+        var arg: []const u8 = &.{};
+        if (sp) |i| {
+            var rest = line[i..];
+            while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
+            arg = rest; // single token (may contain spaces per SysV convention)
+        }
+
+        // Copy the pieces into stable local storage that outlives the recursion
+        // (the incoming `image` buffer is freed when doExecDepth returns).
+        var interp_buf: [1024]u8 = undefined;
+        var arg_buf: [1024]u8 = undefined;
+        var script_buf: [1024]u8 = undefined;
+        if (interp.len >= interp_buf.len or arg.len >= arg_buf.len or script_path.len >= script_buf.len)
+            return error.ExecFailed;
+        @memcpy(interp_buf[0..interp.len], interp);
+        @memcpy(arg_buf[0..arg.len], arg);
+        @memcpy(script_buf[0..script_path.len], script_path);
+        const interp_s = interp_buf[0..interp.len];
+        const arg_s = arg_buf[0..arg.len];
+        const script_s = script_buf[0..script_path.len];
+
+        // Build the new argv: interp, [arg], script, then the original args
+        // after argv[0].
+        var new_argv: [128][]const u8 = undefined;
+        var n: usize = 0;
+        new_argv[n] = interp_s;
+        n += 1;
+        if (arg_s.len > 0) {
+            new_argv[n] = arg_s;
+            n += 1;
+        }
+        new_argv[n] = script_s;
+        n += 1;
+        var i: usize = 1;
+        while (i < argv.len and n < new_argv.len) : (i += 1) {
+            new_argv[n] = argv[i];
+            n += 1;
+        }
+
+        return self.doExecDepth(interp_s, new_argv[0..n], envp, depth + 1);
     }
 };
 

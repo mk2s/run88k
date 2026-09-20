@@ -42,6 +42,7 @@ extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn lseek(fd: c_int, off: c_long, whence: c_int) c_long;
+extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, off: c_long) isize;
 extern "c" fn __errno_location() *c_int;
 
 // Host stat shim (src/host_stat.c). Fixed layout, host-independent.
@@ -108,6 +109,11 @@ pub fn dispatch(runner: *machine.Runner) bool {
         .access => return sysAccess(runner),
         .chdir => return sysChdir(runner),
         .dup => return sysDup(runner),
+        .unlink => return sysUnlink(runner),
+        .rename => return sysRename(runner),
+        .mkdir => return sysMkdir(runner),
+        .rmdir => return sysRmdir(runner),
+        .creat => return sysCreat(runner),
         // Signal syscalls: no signal delivery yet, so accept and return
         // benign success (shells install handlers at startup). sigaction may
         // return the old action; we leave the guest's oldact buffer as-is.
@@ -131,15 +137,17 @@ pub fn dispatch(runner: *machine.Runner) bool {
         .waitsys => return sysWaitsys(runner),
         .uname => return sysUname(runner),
         .pipe => return sysPipe(runner),
-        // ioctl on a tty is common at startup; report "not a tty" so libc
-        // treats stdout as a plain file (fine for echo redirection).
-        .ioctl => {
-            sysv.returnError(cpu, ENOTTY);
-            return true;
-        },
+        .ioctl => return sysIoctl(runner),
         .fcntl => return sysFcntl(runner),
         .time => return sysTime(runner),
         .mmap => return sysMmap(runner),
+        // munmap(addr, len): accept and succeed. We don't reclaim the address
+        // range (mmap_next only grows downward), which is fine for the guest's
+        // purposes — it just wants the unmap to succeed. mprotect likewise.
+        .munmap, .mprotect => {
+            sysv.returnSuccess(cpu, 0);
+            return true;
+        },
         .getdents => return sysGetdents(runner),
         // Identity/permission syscalls: report plausible values so libc is happy.
         .getpid => {
@@ -363,6 +371,101 @@ fn sysAccess(runner: *machine.Runner) bool {
         sysv.returnSuccess(cpu, 0);
     }
     return true;
+}
+
+// Resolve a single guest path argument to a host path, writing errors on the
+// standard failures. Returns the NUL-terminated host path pointer, or null if
+// it already reported an error (caller returns true).
+fn resolveArgPath(
+    runner: *machine.Runner,
+    arg_index: u2,
+    gbuf: []u8,
+    hbuf: []u8,
+) ?[*:0]const u8 {
+    const cpu = &runner.cpu;
+    const path_ptr = sysv.arg(cpu, arg_index);
+    const gpath = readGuestPath(runner, path_ptr, gbuf) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return null;
+    };
+    if (fsOf(runner)) |fs| {
+        const hp = fs.resolve(gpath, hbuf) catch {
+            sysv.returnError(cpu, ENOENT);
+            return null;
+        };
+        return hp.ptr;
+    }
+    return @ptrCast(gbuf[0 .. gpath.len + 1].ptr);
+}
+
+fn sysUnlink(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    var gbuf: [1024]u8 = undefined;
+    var hbuf: [2048]u8 = undefined;
+    const cpath = resolveArgPath(runner, 0, &gbuf, &hbuf) orelse return true;
+    if (fsmod.c.unlink(cpath) < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+    } else {
+        sysv.returnSuccess(cpu, 0);
+    }
+    return true;
+}
+
+fn sysRename(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    // Two path args; resolve both. Use separate buffers so they don't alias.
+    var gbuf1: [1024]u8 = undefined;
+    var hbuf1: [2048]u8 = undefined;
+    var gbuf2: [1024]u8 = undefined;
+    var hbuf2: [2048]u8 = undefined;
+    const oldp = resolveArgPath(runner, 0, &gbuf1, &hbuf1) orelse return true;
+    const newp = resolveArgPath(runner, 1, &gbuf2, &hbuf2) orelse return true;
+    if (fsmod.c.rename(oldp, newp) < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+    } else {
+        sysv.returnSuccess(cpu, 0);
+    }
+    return true;
+}
+
+fn sysMkdir(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const mode = sysv.arg(cpu, 1);
+    var gbuf: [1024]u8 = undefined;
+    var hbuf: [2048]u8 = undefined;
+    const cpath = resolveArgPath(runner, 0, &gbuf, &hbuf) orelse return true;
+    if (fsmod.c.mkdir(cpath, @intCast(mode & 0o7777)) < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+    } else {
+        sysv.returnSuccess(cpu, 0);
+    }
+    return true;
+}
+
+fn sysRmdir(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    var gbuf: [1024]u8 = undefined;
+    var hbuf: [2048]u8 = undefined;
+    const cpath = resolveArgPath(runner, 0, &gbuf, &hbuf) orelse return true;
+    if (fsmod.c.rmdir(cpath) < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+    } else {
+        sysv.returnSuccess(cpu, 0);
+    }
+    return true;
+}
+
+// creat(path, mode) == open(path, O_WRONLY|O_CREAT|O_TRUNC, mode). Route
+// through the same open path so fd-table allocation and flag translation are
+// shared.
+fn sysCreat(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    // Rewrite args to the open() convention: r3 = flags, r4 = mode(existing).
+    // creat's mode is arg1; shift it to arg2 and set flags in arg1.
+    const mode = sysv.arg(cpu, 1);
+    sysv.setArg(cpu, 1, 0x301); // O_WRONLY|O_CREAT|O_TRUNC (guest values)
+    sysv.setArg(cpu, 2, mode);
+    return sysOpen(runner);
 }
 
 fn sysChdir(runner: *machine.Runner) bool {
@@ -598,17 +701,106 @@ fn sysTime(runner: *machine.Runner) bool {
 /// mmap: only anonymous, fixed-nothing allocations are supported (what libc
 /// malloc uses). Hand out zeroed, RW guest memory from a downward bump region.
 /// File-backed mmap is not yet supported.
+extern "c" fn isatty(fd: c_int) c_int;
+
+// SysV/88 terminal ioctls (from the guest's termio.h).
+const TCGETA: u32 = 0x5401;
+const TCSETA: u32 = 0x5402;
+const TCSETAW: u32 = 0x5403;
+const TCSETAF: u32 = 0x5404;
+
+// SVR4 `struct termio`: unsigned short c_iflag,c_oflag,c_cflag,c_lflag;
+// char c_line; unsigned char c_cc[8];  (== 18 bytes, we zero-fill and set a
+// sane default so stdio's isatty()/line-buffering decision succeeds.)
+const TERMIO_LEN: u32 = 18;
+
+fn sysIoctl(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gfd = sysv.arg(cpu, 0);
+    const req = sysv.arg(cpu, 1);
+    const argp = sysv.arg(cpu, 2);
+
+    // Only terminal-control ioctls matter here. stdio issues TCGETA at startup
+    // to decide stdout buffering: success -> the fd is a tty -> line-buffered
+    // (each newline is written immediately); failure (ENOTTY) -> fully
+    // buffered. Tools like size/nm print with printf and rely on the program
+    // exit flushing; when they call _exit without flushing, only line-buffering
+    // makes their output appear. Mirror the host: report tty-ness via isatty on
+    // the mapped host fd, and hand back a plausible termio for TCGET.
+    switch (req) {
+        TCGETA => {
+            const hfd = hostFd(runner, gfd) orelse {
+                sysv.returnError(cpu, EBADF);
+                return true;
+            };
+            if (isatty(hfd) != 1) {
+                sysv.returnError(cpu, ENOTTY);
+                return true;
+            }
+            if (argp != 0 and @as(u64, argp) + TERMIO_LEN <= mem.Memory.size) {
+                const was = runner.memory.enforce;
+                runner.memory.enforce = false;
+                runner.memory.zero(argp, TERMIO_LEN);
+                // c_iflag=BRKINT|ICRNL|IXON (0x2|0x100|0x400=0x502),
+                // c_oflag=OPOST|ONLCR (0x1|0x4=0x5), c_cflag=B9600|CS8|CREAD (0xbd),
+                // c_lflag=ISIG|ICANON|ECHO (0x1|0x2|0x8=0xb). Values are nominal;
+                // only the successful return matters for buffering.
+                runner.memory.write16(argp + 0, 0x0502);
+                runner.memory.write16(argp + 2, 0x0005);
+                runner.memory.write16(argp + 4, 0x00bd);
+                runner.memory.write16(argp + 6, 0x000b);
+                runner.memory.enforce = was;
+            }
+            sysv.returnSuccess(cpu, 0);
+            return true;
+        },
+        TCSETA, TCSETAW, TCSETAF => {
+            // Accept terminal-attribute sets on a tty; ignore the settings.
+            const hfd = hostFd(runner, gfd) orelse {
+                sysv.returnError(cpu, EBADF);
+                return true;
+            };
+            if (isatty(hfd) != 1) {
+                sysv.returnError(cpu, ENOTTY);
+                return true;
+            }
+            sysv.returnSuccess(cpu, 0);
+            return true;
+        },
+        else => {
+            // Unknown ioctl: report not-a-tty, which is the benign answer most
+            // callers expect for a plain file/device.
+            sysv.returnError(cpu, ENOTTY);
+            return true;
+        },
+    }
+}
+
 fn sysMmap(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     // SysV mmap(addr, len, prot, flags, fd, off) — args r2..r7.
     const len = sysv.arg(cpu, 1);
-    const fd = sysv.arg(cpu, 4);
-    const MAP_ANON: u32 = 0x100; // guest flag; file-backed not supported yet
+    const gfd = sysv.arg(cpu, 4);
+    const off = sysv.arg(cpu, 5);
+    const MAP_ANON: u32 = 0x100; // guest flag
     const flags = sysv.arg(cpu, 3);
-    if (fd != 0xffffffff and (flags & MAP_ANON) == 0) {
-        sysv.returnError(cpu, EINVAL); // file-backed mmap unsupported
-        return true;
+
+    // File-backed mmap: libelf (used by size/nm/dump/mcs) maps the object file
+    // MAP_PRIVATE and reads the ELF header straight from the mapping. Emulate a
+    // private file map by allocating a region and reading the file's bytes into
+    // it (copy-on-write semantics are fine for a read-only ELF map). If we
+    // rejected this, libelf falls back to a malloc+read path that leaves the
+    // cached Ehdr (handle+0x6c) unpopulated, so elf_getehdr fails and the tool
+    // prints nothing.
+    const file_backed = gfd != 0xffffffff and (flags & MAP_ANON) == 0;
+    var hfd: c_int = -1;
+    if (file_backed) {
+        hfd = hostFd(runner, gfd) orelse {
+            sysv.returnError(cpu, EBADF);
+            return true;
+        };
     }
+
     const size = std.mem.alignForward(u32, if (len == 0) 1 else len, 0x1000);
     if (runner.mmap_next < runner.brk + 0x10000 or runner.mmap_next -% size < runner.brk) {
         sysv.returnError(cpu, ENOMEM);
@@ -620,6 +812,16 @@ fn sysMmap(runner: *machine.Runner) bool {
     runner.memory.enforce = false;
     runner.memory.zero(base, size);
     runner.memory.addRegion(base, size, .{ .read = true, .write = true }) catch {};
+    if (file_backed) {
+        // Read exactly the requested length from the file offset into the map.
+        var done: u32 = 0;
+        while (done < len) {
+            const dst = runner.memory.bytes[base + done .. base + len];
+            const n = pread(hfd, dst.ptr, dst.len, @intCast(off + done));
+            if (n <= 0) break; // EOF or error: leave the rest zero-filled
+            done += @intCast(n);
+        }
+    }
     runner.memory.enforce = was;
     sysv.returnSuccess(cpu, base);
     return true;
@@ -723,7 +925,28 @@ fn sysFcntl(runner: *machine.Runner) bool {
         return true;
     };
     switch (cmd) {
-        0, 1, 2 => { // F_DUPFD / F_GETFD / F_SETFD
+        0 => { // F_DUPFD: dup `fd` into the lowest free guest fd >= arg3.
+            // Shells build their stdio redirections with this (close(1);
+            // fcntl(pipe_wr, F_DUPFD, 1) makes guest fd 1 the pipe). The result
+            // must be a GUEST fd mapping to the same host file, not a raw host
+            // fd, or the guest's fd bookkeeping breaks after fork/exec.
+            const hnew = dup(fd);
+            if (hnew < 0) {
+                sysv.returnError(cpu, mapErrno(hostErrno()));
+                return true;
+            }
+            if (fsOf(runner)) |fs| {
+                const gnew = fs.allocFdFrom(hnew, arg3) orelse {
+                    _ = close(hnew);
+                    sysv.returnError(cpu, EBADF);
+                    return true;
+                };
+                sysv.returnSuccess(cpu, gnew);
+            } else {
+                sysv.returnSuccess(cpu, @intCast(hnew));
+            }
+        },
+        1, 2 => { // F_GETFD / F_SETFD: pass through to the host fd.
             const rc = fcntl(fd, @intCast(cmd), @intCast(arg3));
             if (rc < 0) sysv.returnError(cpu, mapErrno(hostErrno())) else sysv.returnSuccess(cpu, @intCast(rc));
         },
@@ -907,7 +1130,11 @@ fn sysUname(runner: *machine.Runner) bool {
         runner.memory.write8(base + @as(u32, @intCast(f.len)), 0);
     }
     runner.memory.enforce = was;
-    sysv.returnSuccess(cpu, 0);
+    // SysV/88 uname(2) returns a NON-NEGATIVE value on success — specifically a
+    // positive value (1), not 0. libelf's mmap-availability probe treats a
+    // 0/negative return as "no mmap" and falls back to a malloc+read path that
+    // then fails to parse the ELF header (size/nm then print nothing). Return 1.
+    sysv.returnSuccess(cpu, 1);
     return true;
 }
 
