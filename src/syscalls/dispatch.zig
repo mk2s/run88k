@@ -19,6 +19,7 @@ const machine = @import("../machine.zig");
 const sysv = @import("../abi/sysv88.zig");
 const table = @import("table_sysv88.zig");
 const fsmod = @import("../fs.zig");
+const procmodel = @import("../procmodel.zig");
 
 const Cpu = m88k.Cpu;
 const Syscall = table.Syscall;
@@ -27,6 +28,11 @@ const Syscall = table.Syscall;
 /// (early milestones ran without a guest root).
 fn fsOf(runner: *machine.Runner) ?*fsmod.Fs {
     const p = runner.fs orelse return null;
+    return @ptrCast(@alignCast(p));
+}
+
+fn pmOf(runner: *machine.Runner) ?*procmodel.HostProcess {
+    const p = runner.procmodel orelse return null;
     return @ptrCast(@alignCast(p));
 }
 
@@ -102,6 +108,29 @@ pub fn dispatch(runner: *machine.Runner) bool {
         .access => return sysAccess(runner),
         .chdir => return sysChdir(runner),
         .dup => return sysDup(runner),
+        // Signal syscalls: no signal delivery yet, so accept and return
+        // benign success (shells install handlers at startup). sigaction may
+        // return the old action; we leave the guest's oldact buffer as-is.
+        .sigaction, .sigprocmask, .signal, .sigpending, .sigsuspend => {
+            sysv.returnSuccess(cpu, 0);
+            return true;
+        },
+        .pgrpsys => {
+            // subcode in r2: 0 getpgrp, 1 setpgrp, 2 getsid, 3 setsid,
+            // 4 getpgid, 5 setpgid. Single session/pgrp: return pid-ish 1.
+            const sub = sysv.arg(cpu, 0);
+            switch (sub) {
+                0, 2, 4 => sysv.returnSuccess(cpu, 1), // get* -> group/session 1
+                else => sysv.returnSuccess(cpu, 0), // set* -> ok
+            }
+            return true;
+        },
+        .fork, .vfork => return sysFork(runner),
+        .execve => return sysExec(runner),
+        .wait => return sysWait(runner),
+        .waitsys => return sysWaitsys(runner),
+        .uname => return sysUname(runner),
+        .pipe => return sysPipe(runner),
         // ioctl on a tty is common at startup; report "not a tty" so libc
         // treats stdout as a plain file (fine for echo redirection).
         .ioctl => {
@@ -704,6 +733,200 @@ fn sysFcntl(runner: *machine.Runner) bool {
     }
     return true;
 }
+
+extern "c" fn getpid() c_int;
+
+/// fork/vfork. SVR4 dual-return: parent gets r2=child_pid, r3=0; child gets
+/// r2=parent_pid, r3=1 (libc's fork stub uses r3 to zero r2 in the child).
+fn sysFork(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    const parent_pid: u32 = @intCast(getpid());
+    const rc = pm.doFork() catch {
+        sysv.returnError(cpu, ENOMEM);
+        return true;
+    };
+    if (rc == 0) {
+        // Child: r2 = parent pid, r3 = 1.
+        sysv.returnSuccess2(cpu, parent_pid, 1);
+    } else {
+        // Parent: r2 = child pid, r3 = 0.
+        sysv.returnSuccess2(cpu, rc, 0);
+    }
+    return true;
+}
+
+fn sysExec(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    const path_ptr = sysv.arg(cpu, 0);
+    const argv_ptr = sysv.arg(cpu, 1);
+    const envp_ptr = sysv.arg(cpu, 2);
+
+    var pbuf: [1024]u8 = undefined;
+    const path = readGuestPath(runner, path_ptr, &pbuf) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+
+    // Marshal argv/envp from guest memory into host slices (bounded).
+    var argv_store: [128][]const u8 = undefined;
+    var envp_store: [256][]const u8 = undefined;
+    var argv_bufs: [128][256]u8 = undefined;
+    var envp_bufs: [256][256]u8 = undefined;
+    const argc = readStrVec(runner, argv_ptr, &argv_store, &argv_bufs);
+    const envc = readStrVec(runner, envp_ptr, &envp_store, &envp_bufs);
+
+    pm.doExec(path, argv_store[0..argc], envp_store[0..envc]) catch {
+        sysv.returnError(cpu, ENOENT);
+        return true;
+    };
+    // Success: doExec set PC to the new entry via process.setup; do NOT touch
+    // PC or carry. Clear any stale fault from the reload and continue.
+    runner.memory.clearFault();
+    runner.exec_pending = true;
+    return true;
+}
+
+/// Read a NULL-terminated guest pointer vector (argv/envp) into host slices,
+/// copying each string into the provided per-entry buffers. Returns the count.
+fn readStrVec(
+    runner: *machine.Runner,
+    vec_ptr: u32,
+    out: [][]const u8,
+    bufs: anytype,
+) usize {
+    if (vec_ptr == 0) return 0;
+    var n: usize = 0;
+    while (n < out.len) {
+        const p = runner.memory.read32(vec_ptr + @as(u32, @intCast(n)) * 4);
+        if (p == 0) break;
+        const s = runner.memory.readCStr(p, bufs[n][0 .. bufs[n].len - 1]);
+        bufs[n][s.len] = 0;
+        out[n] = bufs[n][0..s.len];
+        n += 1;
+    }
+    return n;
+}
+
+fn sysWait(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    const statptr = sysv.arg(cpu, 0);
+    const res = pm.doWait() catch {
+        sysv.returnError(cpu, ECHILD);
+        return true;
+    };
+    // SysV wait: pid in r2, status word in r3. If a status pointer was given,
+    // also store the status there.
+    if (statptr != 0 and @as(u64, statptr) + 4 <= mem.Memory.size) {
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        runner.memory.write32(statptr, res.status);
+        runner.memory.enforce = was;
+    }
+    sysv.returnSuccess2(cpu, res.pid, res.status);
+    return true;
+}
+
+// SVR4 waitsys(idtype, id, siginfo*, options) — syscall 107, the kernel
+// primitive under libc's waitpid/wait. Reaps a child and fills a siginfo_t.
+// The libc wrapper (recovered: FUN_000307c0) reads these siginfo fields:
+//   +8  si_code   int   1 = CLD_EXITED (normal exit)
+//   +12 si_pid    int   child pid
+//   +23 si_status byte  exit code (wrapper does status<<8 when si_code==1)
+// Returns 0 on success (the pid comes back via siginfo, not r2).
+const SIGINFO_CODE_OFF: u32 = 8;
+const SIGINFO_PID_OFF: u32 = 12;
+const SIGINFO_STATUS_OFF: u32 = 23;
+const CLD_EXITED: u32 = 1;
+
+fn sysWaitsys(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        sysv.returnError(cpu, ECHILD);
+        return true;
+    };
+    const infop = sysv.arg(cpu, 2); // siginfo_t* buffer
+    const res = pm.doWait() catch {
+        sysv.returnError(cpu, ECHILD);
+        return true;
+    };
+    // doWait packs the exit code as (code & 0xff) << 8; recover the raw code.
+    const exit_code: u32 = (res.status >> 8) & 0xff;
+    if (infop != 0 and @as(u64, infop) + 32 <= mem.Memory.size) {
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        // Zero the leading fields (si_signo/si_errno) then set code/pid/status.
+        runner.memory.write32(infop, 18); // si_signo = SIGCLD (18 on SysV/88)
+        runner.memory.write32(infop + 4, 0); // si_errno
+        runner.memory.write32(infop + SIGINFO_CODE_OFF, CLD_EXITED);
+        runner.memory.write32(infop + SIGINFO_PID_OFF, res.pid);
+        runner.memory.write8(infop + SIGINFO_STATUS_OFF, @intCast(exit_code & 0xff));
+        runner.memory.enforce = was;
+    }
+    sysv.returnSuccess(cpu, 0);
+    return true;
+}
+
+// uname(2) — syscall 135. Fills a SVR4 `struct utsname`: five NUL-terminated
+// fields, each SYS_NMLN (257) bytes: sysname, nodename, release, version,
+// machine. Returns 0 (non-negative) on success.
+const SYS_NMLN: u32 = 257;
+
+fn sysUname(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const buf = sysv.arg(cpu, 0);
+    const total = SYS_NMLN * 5;
+    if (buf == 0 or @as(u64, buf) + total > mem.Memory.size) {
+        sysv.returnError(cpu, EFAULT);
+        return true;
+    }
+    const fields = [_][]const u8{
+        "UNIX_SV", // sysname
+        "run88k", // nodename
+        "4.0", // release
+        "3.0", // version
+        "m88k", // machine
+    };
+    const was = runner.memory.enforce;
+    runner.memory.enforce = false;
+    runner.memory.zero(buf, total);
+    for (fields, 0..) |f, i| {
+        const base = buf + @as(u32, @intCast(i)) * SYS_NMLN;
+        runner.memory.writeBytes(base, f);
+        runner.memory.write8(base + @as(u32, @intCast(f.len)), 0);
+    }
+    runner.memory.enforce = was;
+    sysv.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysPipe(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    const fds = pm.doPipe() catch {
+        sysv.returnError(cpu, ENOMEM);
+        return true;
+    };
+    // SysV pipe: read fd in r2, write fd in r3.
+    sysv.returnSuccess2(cpu, fds[0], fds[1]);
+    return true;
+}
+
+const ECHILD: u32 = 10;
 
 fn failFast(runner: *machine.Runner, num: u32, sc: Syscall) void {
     runner.aborted = true;

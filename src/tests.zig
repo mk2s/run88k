@@ -14,4 +14,5 @@ test {
     _ = @import("difftrace.zig");
     _ = @import("fs.zig");
     _ = @import("loaders/dynamic.zig");
+    _ = @import("procmodel.zig");
 }

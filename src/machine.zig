@@ -59,6 +59,8 @@ pub const Runner = struct {
     /// import cycle (fs is imported by the dispatcher, not by machine). The
     /// dispatcher casts it back to *fs.Fs.
     fs: ?*anyopaque = null,
+    /// Process model (fork/exec/wait/pipe). Type-erased, same reasoning.
+    procmodel: ?*anyopaque = null,
 
     /// Set when the guest exits; holds the process exit status.
     exit_status: ?u32 = null,
@@ -75,6 +77,13 @@ pub const Runner = struct {
     mmap_next: u32 = 0x0800_0000,
     /// umask (tracked; applied host-side).
     umask: u32 = 0,
+    /// Set by a successful execve: the run loop must NOT advance PC past the
+    /// trap (the handler already set PC to the new image's entry). Cleared by
+    /// the run loop after honoring it.
+    exec_pending: bool = false,
+    /// Ring buffer of recent PCs (diagnostics for runaway/timeout).
+    pc_ring: [32]u32 = @splat(0),
+    pc_ring_i: usize = 0,
     /// Instruction budget guard against a runaway guest.
     steps_run: u64 = 0,
 
@@ -123,6 +132,8 @@ pub const Runner = struct {
 
         var budget = max_steps;
         while (budget > 0) : (budget -= 1) {
+            self.pc_ring[self.pc_ring_i % self.pc_ring.len] = self.cpu.pc;
+            self.pc_ring_i +%= 1;
             const result = m88k.step(&self.cpu);
             self.steps_run += 1;
 

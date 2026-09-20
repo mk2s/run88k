@@ -20,6 +20,7 @@ const dispatch = @import("syscalls/dispatch.zig");
 const difftrace = @import("difftrace.zig");
 const fsmod = @import("fs.zig");
 const dynamic = @import("loaders/dynamic.zig");
+const procmodel = @import("procmodel.zig");
 
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
@@ -90,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
             argv_buf[n] = a;
             n += 1;
         }
-        try difftrace.run(gpa, io, rest[1], argv_buf[0..n], lo, hi, max);
+        try difftrace.run(gpa, io, rest[1], argv_buf[0..n], lo, hi, max, mounts[0..nmounts]);
         return;
     }
 
@@ -139,6 +140,14 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     runner.handler = &dispatch.dispatch;
     if (fs) |*f| runner.fs = f;
 
+    // Process model (fork/exec/wait/pipe) — needs the fs for exec path
+    // resolution. Only wired when a mount table is present.
+    var pm: ?procmodel.HostProcess = null;
+    if (fs) |*f| {
+        pm = procmodel.HostProcess.init(&runner, f, io, gpa);
+        runner.procmodel = &pm.?;
+    }
+
     // Dynamic linking: load NEEDED libraries and apply relocations. Requires a
     // mount table so the interpreter/libraries resolve.
     if (img.is_dynamic) {
@@ -178,6 +187,12 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
         },
         .timed_out => {
             outf("run88k: guest timed out after {d} instructions (runaway?)\n", .{runner.steps_run});
+            out("recent PCs: ");
+            var k: usize = 0;
+            while (k < runner.pc_ring.len) : (k += 1) {
+                outf("{x} ", .{runner.pc_ring[(runner.pc_ring_i + k) % runner.pc_ring.len]});
+            }
+            out("\n");
             return 124;
         },
         .trap => {

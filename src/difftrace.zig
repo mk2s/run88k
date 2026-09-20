@@ -20,6 +20,9 @@ const elf = @import("loaders/elf.zig");
 const process = @import("process.zig");
 const sysv = @import("abi/sysv88.zig");
 const dispatch = @import("syscalls/dispatch.zig");
+const fsmod = @import("fs.zig");
+const dynamic = @import("loaders/dynamic.zig");
+const procmodel = @import("procmodel.zig");
 
 extern "c" fn dprintf(fd: c_int, fmt: [*:0]const u8, ...) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
@@ -35,7 +38,7 @@ fn memOperand(cpu: *const Cpu, op: u32) ?u32 {
     const s1 = cpu.getReg(@intCast((op >> 16) & 0x1f));
     switch (op1) {
         // Immediate load/store/xmem: EA = rS1 + zext(imm16)
-        0x00, 0x01, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b => {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b => {
             return s1 +% (op & 0xffff);
         },
         // Register-indexed load/store/xmem live in op1=0x3d with op4 in 15..12.
@@ -78,6 +81,7 @@ pub fn run(
     win_lo: u32,
     win_hi: u32,
     max_emit: usize,
+    mounts: []const fsmod.Mount,
 ) !void {
     const image = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch {
         _ = dprintf(2, "difftrace: cannot read binary\n");
@@ -90,10 +94,42 @@ pub fn run(
     defer mem.setActive(null);
     const img = try elf.load(&memory, image);
 
+    // Guest filesystem (mount table + fd table), if any mounts were given.
+    // sh and dynamic binaries need this to resolve paths and libraries.
+    var fs: ?fsmod.Fs = null;
+    if (mounts.len > 0) {
+        fs = try fsmod.Fs.init(gpa);
+        for (mounts) |m| fs.?.addMount(m.guest_prefix, m.host_root) catch {};
+    }
+    defer if (fs) |*f| f.deinit();
+
     var runner = machine.Runner.init(&memory);
     runner.attachBus();
     runner.syscall_vector = sysv.syscall_vector;
     runner.handler = &dispatch.dispatch;
+    if (fs) |*f| runner.fs = f;
+
+    // Process model (fork/exec/wait/pipe), only when a mount table is present.
+    var pm: ?procmodel.HostProcess = null;
+    if (fs) |*f| {
+        pm = procmodel.HostProcess.init(&runner, f, io, gpa);
+        runner.procmodel = &pm.?;
+    }
+
+    // Dynamic linking: load NEEDED libraries and apply relocations.
+    if (img.is_dynamic) {
+        if (fs) |*f| {
+            dynamic.reset();
+            dynamic.link(&memory, f, io, gpa, img.dynamic_vaddr, img.brk) catch {
+                _ = dprintf(2, "difftrace: dynamic link failed\n");
+                return;
+            };
+        } else {
+            _ = dprintf(2, "difftrace: binary is dynamic; pass --root/--mount\n");
+            return;
+        }
+    }
+
     const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
     try process.setup(&runner, img.entry, img.brk, argv, &envp);
     memory.enforce = true;
