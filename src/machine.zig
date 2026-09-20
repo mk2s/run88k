@@ -46,6 +46,17 @@ pub const StopReason = enum {
 /// from `runner.cpu`, services the call, writes the result, and adjusts PC.
 pub const SyscallFn = *const fn (runner: *Runner) bool;
 
+/// A tracked file-backed mmap region. `host_fd` is a dup of the guest's file
+/// descriptor kept open for the mapping's lifetime so write-back on munmap
+/// works even after the guest closes its own fd. -1 host_fd = free slot.
+pub const FileMap = struct {
+    base: u32 = 0,
+    len: u32 = 0,
+    file_off: u32 = 0,
+    host_fd: i32 = -1,
+    shared: bool = false,
+};
+
 pub const Runner = struct {
     cpu: Cpu = .{},
     memory: *mem.Memory,
@@ -75,6 +86,10 @@ pub const Runner = struct {
     /// mmap bump pointer for anonymous allocations (grows down from a high
     /// region, kept clear of the stack).
     mmap_next: u32 = 0x0800_0000,
+    /// Active file-backed mmap regions (for MAP_SHARED write-back on munmap).
+    /// Tools like `as`/`ld` build their ELF output in a MAP_SHARED mapping of
+    /// the output file and rely on munmap flushing it back.
+    file_maps: [16]FileMap = @splat(.{}),
     /// umask (tracked; applied host-side).
     umask: u32 = 0,
     /// Set by a successful execve: the run loop must NOT advance PC past the

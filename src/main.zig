@@ -44,12 +44,19 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1;
     var mounts: [16]fsmod.Mount = undefined;
     var nmounts: usize = 0;
+    var init_cwd: ?[]const u8 = null;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--trace")) {
             dispatch.trace = true;
         } else if (std.mem.eql(u8, args[i], "--selftest")) {
             try selftest(gpa);
             return;
+        } else if (std.mem.eql(u8, args[i], "--cwd") and i + 1 < args.len) {
+            // Set the guest's initial working directory (guest-absolute). Tools
+            // like cc run their sub-tools with output paths relative to CWD, so
+            // this must point at a writable mount to compile into.
+            init_cwd = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--root") and i + 1 < args.len) {
             if (nmounts < mounts.len) {
                 mounts[nmounts] = .{ .guest_prefix = "/", .host_root = args[i + 1] };
@@ -70,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
 
     const rest = args[i..];
     if (rest.len >= 2 and std.mem.eql(u8, rest[0], "run")) {
-        const code = try cmdRun(gpa, io, rest[1], rest[1..], mounts[0..nmounts]);
+        const code = try cmdRun(gpa, io, rest[1], rest[1..], mounts[0..nmounts], init_cwd);
         std.process.exit(@intCast(code & 0xff));
     }
 
@@ -109,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// Load and run a guest ELF binary. `path` is the host path to the binary;
 /// `argv` is the guest argument vector (argv[0] = program name).
-fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []const u8, mounts: []const fsmod.Mount) !u32 {
+fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []const u8, mounts: []const fsmod.Mount, init_cwd: ?[]const u8) !u32 {
     // Read the whole binary.
     const image = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch |e| {
         outf("run88k: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
@@ -131,6 +138,10 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     if (mounts.len > 0) {
         fs = try fsmod.Fs.init(gpa);
         for (mounts) |m| fs.?.addMount(m.guest_prefix, m.host_root) catch {};
+        if (init_cwd) |cw| fs.?.chdir(cw) catch {
+            outf("run88k: --cwd '{s}' invalid\n", .{cw});
+            return 126;
+        };
     }
     defer if (fs) |*f| f.deinit();
 

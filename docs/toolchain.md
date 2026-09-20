@@ -3,19 +3,52 @@
 All three are dynamically-linked ELF (`interpreter /usr/lib/libc.so.1`), the same
 class as `date`, and they all load + run their dynamic startup.
 
+## RESOLVED: full `cc` compile works end-to-end
+
+`cc -o hi hi.c` compiles a real C program (cpp -> ccom -> as -> ld) to a valid
+`ELF 32-bit MSB executable, Motorola m88k, dynamically linked`, and the result
+RUNS under run88k (prints via printf, returns its exit code). Verified:
+```
+$ cc -o hi hi.c          # hi.c: printf("hello from m88k cc\n"); return 3;
+$ run88k ... run hi   ->  hello from m88k cc   (exit 3)
+```
+
+Three things had to be in place (all in the syscall layer):
+1. **file-backed mmap with MAP_SHARED write-back.** `as` and `ld` build their
+   ELF output in a `mmap(fd, MAP_SHARED)` of the output file and rely on
+   `munmap` flushing the mapped bytes back to disk. `sysMmap` now `pread`s the
+   file into the region on map; MAP_SHARED file maps are tracked (with a dup'd
+   fd) and `munmap` `pwrite`s the region back. Without write-back, `as`
+   produced a 0-byte `.o` (this was the real cause of the old "as faults on a
+   real token" symptom — after earlier fixes it stopped faulting but silently
+   wrote nothing).
+2. **`--cwd <guest-dir>` flag.** `cc` runs its sub-tools with output paths
+   relative to the CWD (e.g. `as` writes `t.o`, not `/work/t.o`). The guest CWD
+   defaults to `/` (read-only root), so relative outputs failed with "Cannot
+   Open Output File". Run with `--cwd /work` (a writable mount).
+3. **New syscalls:** `memcntl (131)` (advisory cache/sync, no-op success),
+   `chmod (15)` + `fchmod (93)` (ld sets the output's mode; path-resolved
+   through the mount table). Plus `munmap (117)`/`mprotect (116)` from the
+   size/nm work.
+
 ## Requirements to run the toolchain
 - Mounts: `--root <hd0_root> --mount /usr=<hd0_slice3>` as usual, PLUS a
-  **writable temp** at the guest's temp path. The guest `/tmp` is a symlink to
-  `/var/tmp`, which is not populated on the mounted image, so `as`/`cc` cannot
-  create their intermediate (relocation) files without one. Provide e.g.
-  `--mount /var/tmp=/tmp/guest_vartmp` (a writable host dir).
-- A writable working dir for outputs, e.g. `--mount /work=/tmp/asm88`.
+  **writable temp** at the guest's temp path (`--mount /var/tmp=/tmp/guest_vartmp`)
+  AND a **writable working dir** (`--mount /work=/tmp/asm88`).
+- **`--cwd /work`** so sub-tool relative output paths land in the writable dir.
 
-## Syscalls added this session (surfaced by the toolchain)
+## Syscalls added (surfaced by the toolchain)
 - **unlink (10)**, **rename (134)**, **mkdir (80)**, **rmdir (79)**,
   **creat (8)** — path-resolved through the mount table (creat delegates to
   open with O_WRONLY|O_CREAT|O_TRUNC). `as` uses unlink/rename to manage its
   temp relocation file.
+- **memcntl (131)**, **chmod (15)**, **fchmod (93)**, **munmap (117)**,
+  **mprotect (116)** — see the cc section above.
+
+## RESOLVED: `as` (/usr/ccs/bin/as) — WORKS
+Assembles a real `.s` (directives + instructions) to a valid m88k ELF
+relocatable. The former "faults / empty .o on a real token" was the
+MAP_SHARED-writeback gap, now fixed.
 
 ## RESOLVED: the `lda` core bug (was blocking as/dis/cc)
 

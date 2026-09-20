@@ -108,6 +108,8 @@ pub fn dispatch(runner: *machine.Runner) bool {
         .lstat => return sysLstat(runner),
         .access => return sysAccess(runner),
         .chdir => return sysChdir(runner),
+        .chmod => return sysChmod(runner),
+        .fchmod => return sysFchmod(runner),
         .dup => return sysDup(runner),
         .unlink => return sysUnlink(runner),
         .rename => return sysRename(runner),
@@ -144,7 +146,20 @@ pub fn dispatch(runner: *machine.Runner) bool {
         // munmap(addr, len): accept and succeed. We don't reclaim the address
         // range (mmap_next only grows downward), which is fine for the guest's
         // purposes — it just wants the unmap to succeed. mprotect likewise.
-        .munmap, .mprotect => {
+        .munmap => {
+            // Flush a MAP_SHARED file mapping back to its file before dropping.
+            _ = flushFileMap(runner, sysv.arg(cpu, 0), sysv.arg(cpu, 1));
+            sysv.returnSuccess(cpu, 0);
+            return true;
+        },
+        .mprotect => {
+            sysv.returnSuccess(cpu, 0);
+            return true;
+        },
+        // memcntl(addr,len,cmd,...): advisory memory control (sync, lock,
+        // MC_ADVISE, cache flush). No-op that succeeds; the assembler calls it
+        // (likely MC_SYNC / icache flush after emitting code to its buffer).
+        .memcntl => {
             sysv.returnSuccess(cpu, 0);
             return true;
         },
@@ -468,6 +483,51 @@ fn sysCreat(runner: *machine.Runner) bool {
     return sysOpen(runner);
 }
 
+// chmod(path, mode): ld/install set the mode of their output. Resolve the
+// guest path through the mount table and apply on the host. Read-only mounts
+// will return an error from the host, which we map through.
+fn sysChmod(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const path_ptr = sysv.arg(cpu, 0);
+    const mode = sysv.arg(cpu, 1);
+    var gbuf: [1024]u8 = undefined;
+    const gpath = readGuestPath(runner, path_ptr, &gbuf) orelse {
+        sysv.returnError(cpu, EINVAL);
+        return true;
+    };
+    var cpath: [*:0]const u8 = @ptrCast(gbuf[0 .. gpath.len + 1].ptr);
+    var hbuf: [2048]u8 = undefined;
+    if (fsOf(runner)) |fs| {
+        const hp = fs.resolve(gpath, &hbuf) catch {
+            sysv.returnError(cpu, ENOENT);
+            return true;
+        };
+        cpath = hp.ptr;
+    }
+    if (chmod(cpath, @intCast(mode & 0o7777)) < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+        return true;
+    }
+    sysv.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysFchmod(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gfd = sysv.arg(cpu, 0);
+    const mode = sysv.arg(cpu, 1);
+    const hfd = hostFd(runner, gfd) orelse {
+        sysv.returnError(cpu, EBADF);
+        return true;
+    };
+    if (fchmod(hfd, @intCast(mode & 0o7777)) < 0) {
+        sysv.returnError(cpu, mapErrno(hostErrno()));
+        return true;
+    }
+    sysv.returnSuccess(cpu, 0);
+    return true;
+}
+
 fn sysChdir(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const path_ptr = sysv.arg(cpu, 0);
@@ -680,6 +740,8 @@ fn sysStatImpl(runner: *machine.Runner, is_lstat: bool, new_layout: bool) bool {
 
 extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
 extern "c" fn dup(fd: c_int) c_int;
+extern "c" fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
 extern "c" fn time(t: ?*c_long) c_long;
 
 fn sysTime(runner: *machine.Runner) bool {
@@ -821,10 +883,61 @@ fn sysMmap(runner: *machine.Runner) bool {
             if (n <= 0) break; // EOF or error: leave the rest zero-filled
             done += @intCast(n);
         }
+        const MAP_SHARED: u32 = 0x1;
+        if ((flags & MAP_SHARED) != 0) {
+            // Track for write-back on munmap. dup the fd so a later guest
+            // close() doesn't strand the mapping. Silently skip tracking if
+            // the table is full or dup fails (mapping still readable).
+            const dupfd = dup(hfd);
+            if (dupfd >= 0) {
+                var slot: ?*machine.FileMap = null;
+                for (&runner.file_maps) |*m| {
+                    if (m.host_fd < 0) {
+                        slot = m;
+                        break;
+                    }
+                }
+                if (slot) |m| {
+                    m.* = .{ .base = base, .len = len, .file_off = off, .host_fd = dupfd, .shared = true };
+                } else {
+                    _ = close(dupfd);
+                }
+            }
+        }
     }
     runner.memory.enforce = was;
     sysv.returnSuccess(cpu, base);
     return true;
+}
+
+extern "c" fn pwrite(fd: c_int, buf: [*]const u8, count: usize, off: c_long) isize;
+
+/// Flush and drop any tracked file-backed MAP_SHARED region overlapping
+/// [addr, addr+len). Returns true if a mapping was found and released.
+fn flushFileMap(runner: *machine.Runner, addr: u32, len: u32) bool {
+    var found = false;
+    for (&runner.file_maps) |*m| {
+        if (m.host_fd < 0 or !m.shared) continue;
+        // Match if the munmap range intersects the mapping.
+        const m_end = m.base +% m.len;
+        const u_end = addr +% len;
+        if (addr >= m_end or u_end <= m.base) continue;
+        // Write the whole mapped region back to the file at its offset.
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        var done: u32 = 0;
+        while (done < m.len) {
+            const src = runner.memory.bytes[m.base + done .. m.base + m.len];
+            const n = pwrite(m.host_fd, src.ptr, src.len, @intCast(m.file_off + done));
+            if (n <= 0) break;
+            done += @intCast(n);
+        }
+        runner.memory.enforce = was;
+        _ = close(m.host_fd);
+        m.* = .{};
+        found = true;
+    }
+    return found;
 }
 
 // Directory-read shim (src/host_dir.c): opendir/readdir/closedir keyed by a
