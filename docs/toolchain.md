@@ -31,11 +31,37 @@ Three things had to be in place (all in the syscall layer):
    through the mount table). Plus `munmap (117)`/`mprotect (116)` from the
    size/nm work.
 
+## Verified cc capabilities
+- **`-O` optimization works**: `cc -O -o hi hi.c` produces a correct binary
+  (optimizer register allocation, the `optim` pass — all fine).
+- **Multi-translation-unit**: `cc -O -c -o a.o a.c`, `cc -O -c -o b.o b.c`,
+  `cc -o prog a.o b.o` links and runs correctly.
+- Exercised: recursion (fib), `%`/loops (gcd), string.h (strcpy/strcat/strlen),
+  nested-loop sort, arrays, exit codes — all correct.
+- **Language level is K&R / C89** (1991 CCCS). C99isms fail with real cc
+  diagnostics: no `for(int i=...)` init-decls, no mid-block declarations. Use
+  old-style function defs and top-of-block declarations.
+
+## KNOWN: `cc` without `-o` faults (latent cc driver bug, NOT an emulator bug)
+`cc foo.c` / `cc -c foo.c` (no explicit `-o`) faults with a NULL deref inside
+libc `strcmp` (guest pc 0x341c8, `ld.bu r2,r3,r5` with r3=0). Root cause traced
+entirely to cc's own driver: in the per-input-file loop it does
+`strcmp(basename, <-o argument>)` to detect an output==input collision, but the
+`-o`-argument local (stack fp+0x7c) is only initialized by the `-o` option
+handler (cc code at 0x213ac/0x213ec). With no `-o` that slot stays NULL and cc
+strcmps NULL. Every syscall succeeded and the CPU faithfully executed the NULL
+deref cc coded — verified the working `-c -o util.o` run initializes the same
+slot to a valid pointer (0xbffffdd) and does not fault. Page 0 is unmapped on
+SysV/88 R4.0 too, so this would fault on real hardware unless that stack slot
+held stale non-NULL garbage. **Workaround: always pass `-o`.** (Mapping a zero
+page to paper over it was rejected — it would mask genuine null-deref bugs.)
+
 ## Requirements to run the toolchain
 - Mounts: `--root <hd0_root> --mount /usr=<hd0_slice3>` as usual, PLUS a
   **writable temp** at the guest's temp path (`--mount /var/tmp=/tmp/guest_vartmp`)
   AND a **writable working dir** (`--mount /work=/tmp/asm88`).
 - **`--cwd /work`** so sub-tool relative output paths land in the writable dir.
+- **Always pass `-o`** (see the no-`-o` cc bug above).
 
 ## Syscalls added (surfaced by the toolchain)
 - **unlink (10)**, **rename (134)**, **mkdir (80)**, **rmdir (79)**,

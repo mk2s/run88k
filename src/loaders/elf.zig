@@ -66,6 +66,44 @@ pub fn rd32(b: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, b[off..][0..4], .big);
 }
 
+pub const SHT_SYMTAB = 2;
+pub const SHT_STRTAB = 3;
+
+/// Locate the (`.symtab`, its `.strtab`) section byte-ranges in a file image.
+/// These are non-ALLOC sections (not mapped into guest memory), so they can
+/// only be read from the raw file. Returns null when absent (e.g. a stripped
+/// object). The returned slices point into `image`.
+pub const SymtabSlices = struct { sym: []const u8, str: []const u8 };
+pub fn findSymtab(image: []const u8) ?SymtabSlices {
+    if (image.len < 0x34) return null;
+    const e_shoff = rd32(image, 32);
+    const e_shentsize = rd16(image, 46);
+    const e_shnum = rd16(image, 48);
+    if (e_shoff == 0 or e_shentsize < 40 or e_shnum == 0) return null;
+    // Find SHT_SYMTAB; its sh_link is the associated string table section.
+    var i: usize = 0;
+    while (i < e_shnum) : (i += 1) {
+        const sh = e_shoff + i * e_shentsize;
+        if (sh + 40 > image.len) return null;
+        if (rd32(image, sh + 4) != SHT_SYMTAB) continue;
+        const sym_off = rd32(image, sh + 16);
+        const sym_size = rd32(image, sh + 20);
+        const sym_link = rd32(image, sh + 24); // strtab section index
+        if (@as(u64, sym_off) + sym_size > image.len) return null;
+        if (sym_link >= e_shnum) return null;
+        const lsh = e_shoff + sym_link * e_shentsize;
+        if (lsh + 40 > image.len) return null;
+        const str_off = rd32(image, lsh + 16);
+        const str_size = rd32(image, lsh + 20);
+        if (@as(u64, str_off) + str_size > image.len) return null;
+        return .{
+            .sym = image[sym_off .. sym_off + sym_size],
+            .str = image[str_off .. str_off + str_size],
+        };
+    }
+    return null;
+}
+
 /// Validate the ELF header for an m88k big-endian object. Returns nothing on
 /// success; the caller reads e_type etc. directly.
 pub fn checkHeader(image: []const u8) Error!void {

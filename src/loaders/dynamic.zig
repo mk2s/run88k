@@ -24,11 +24,16 @@ const fsmod = @import("../fs.zig");
 const rd32 = elf.rd32;
 
 const DBG = false;
+extern "c" fn dprintf(fd: c_int, fmt: [*:0]const u8, ...) c_int;
+fn dbg(comptime fmt: []const u8, args: anytype) void {
+    var buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(buf[0 .. buf.len - 2], fmt, args) catch return;
+    buf[line.len] = '\n';
+    buf[line.len + 1] = 0;
+    _ = dprintf(2, "%s", @as([*:0]const u8, @ptrCast(&buf)));
+}
 fn dbgPreempt(name: []const u8, slot: u32, old: u32, new: u32) void {
-    _ = name;
-    _ = slot;
-    _ = old;
-    _ = new;
+    dbg("reloc-preempt {s}: slot={x} {x} -> {x}", .{ name, slot, old, new });
 }
 
 pub const Error = error{
@@ -87,16 +92,25 @@ const Object = struct {
     nchain: u32 = 0, // number of symbols (from the hash table's nchain)
     needed: [8]u32 = @splat(0), // DT_NEEDED string offsets
     n_needed: usize = 0,
+
+    // Host-retained .symtab/.strtab bytes (NOT loaded into guest memory — these
+    // sections are non-ALLOC, so mapSegments never maps them). Kept so we can
+    // resolve a library's INTERNAL data symbols (e.g. libc's __iob / _lastbuf /
+    // _bufendtab), which are absent from .dynsym but are the storage libc's own
+    // GOT slots point at. Owned by the linker; freed in reset(). Empty slices
+    // when the object has no .symtab.
+    lsym: []const u8 = &.{}, // raw .symtab bytes
+    lstr: []const u8 = &.{}, // raw .strtab bytes (for .symtab)
 };
 
 const MAX_OBJECTS = 16;
 const LIB_BASE_START: u32 = 0x0500_0000; // load libraries here, upward
 const LIB_STRIDE: u32 = 0x0080_0000; // spacing between library load bases
-const LINKMAP_REGION: u32 = 0x0400_0000; // scratch for the synthesized link_map chain
 
 pub const Linker = struct {
     memory: *mem.Memory,
     fs: *fsmod.Fs,
+    gpa: ?std.mem.Allocator = null, // for freeing retained .symtab bytes
     objs: [MAX_OBJECTS]Object = undefined,
     n_objs: usize = 0,
     next_base: u32 = LIB_BASE_START,
@@ -270,50 +284,45 @@ pub const Linker = struct {
         }
     }
 
-    /// Build the `struct link_map` chain (link.h: l_addr@0, l_name@4, l_ld@8,
-    /// l_next@12, l_prev@16 — 20 bytes) for all loaded objects and publish the
-    /// head into libc's `__first_link[0]`. This is the book-keeping the real
-    /// ld.so leaves for libc (fflush and friends walk it via l_next@0xc).
-    fn buildLinkMap(self: *Linker) Error!void {
-        const first = self.lookup("__first_link") orelse return; // no such libc: nothing to do
-        // Reserve a scratch region for the link_map array + object name strings.
-        const LM_SIZE: u32 = 20;
-        const region = LINKMAP_REGION;
-        const region_len: u32 = 0x2000;
-        self.memory.addRegion(region, region_len, .{ .read = true, .write = true }) catch {};
+    /// Point libc's stdio FILE-list head (`__first_link`) at the executable's
+    /// `__iob` FILE array. This libc's `__first_link` is NOT a `struct
+    /// link_map` — it is the head of the stdio flush registry that `fflush`
+    /// (and exit's `_cleanup`) walk. Its layout, as fflush reads it:
+    ///     [+0]  FILE*  — pointer to a FILE array (the object's iob)
+    ///     [+8]  int    — number of FILEs in that array
+    ///     [+0xc] next  — pointer to the next registry node (0 = end)
+    /// The file image ships `[+0]=0, [+8]=NIOB (0x14), [+4]` RELATIVE-reloc'd,
+    /// `[+0xc]=0`; libc's own startup would set `[+0]` to `&__iob`. Because the
+    /// executable COPY-relocates `__iob` into its .bss, the ONE true FILE array
+    /// is the exe's copy — so we point `[+0]` there. Without this, `[+0]` is 0
+    /// (or, previously, a bogus synthesized value), fflush walks the wrong/empty
+    /// table, and buffered output to a pipe/file is dropped (e.g. `tr`).
+    fn initStdioRegistry(self: *Linker) Error!void {
+        const first = self.lookup("__first_link") orelse return; // not this libc
+        // Point [+0] at the ONE true __iob FILE array:
+        //   - if the exe COPY-relocated __iob into its .bss, that copy is
+        //     canonical (a library's own __iob GOT slot was redirected to it);
+        //   - otherwise the exe uses libc's own __iob directly, so point there.
+        // libc's __iob lives in .symtab (not .dynsym), so find it via the
+        // retained host symtab of whichever library defines it.
+        var iob: u32 = self.preemptOf("__iob") orelse 0;
+        if (iob == 0) {
+            var oi: usize = 1;
+            while (oi < self.n_objs) : (oi += 1) {
+                if (self.hostSymByName(&self.objs[oi], "__iob")) |s| {
+                    iob = s.addr;
+                    break;
+                }
+            }
+        }
+        if (iob == 0) return; // no __iob anywhere: nothing to point at
         const was = self.memory.enforce;
         self.memory.enforce = false;
         defer self.memory.enforce = was;
-        self.memory.zero(region, region_len);
-
-        var map_at = region;
-        var name_at = region + LM_SIZE * @as(u32, @intCast(self.n_objs)) + 4;
-        var prev: u32 = 0;
-        var head: u32 = 0;
-        var oi: usize = 0;
-        while (oi < self.n_objs) : (oi += 1) {
-            const obj = &self.objs[oi];
-            const lm = map_at;
-            map_at += LM_SIZE;
-            if (head == 0) head = lm;
-            self.memory.write32(lm + 0, obj.bias); // l_addr
-            self.memory.write32(lm + 4, name_at); // l_name (short placeholder)
-            self.memory.write32(lm + 8, obj.dynamic_vaddr); // l_ld
-            self.memory.write32(lm + 12, 0); // l_next (filled below)
-            self.memory.write32(lm + 16, prev); // l_prev
-            if (prev != 0) self.memory.write32(prev + 12, lm); // prev->l_next = lm
-            // A minimal name string ("obj0", "obj1", ...) is enough for fflush.
-            self.memory.write8(name_at + 0, 'o');
-            self.memory.write8(name_at + 1, 'b');
-            self.memory.write8(name_at + 2, 'j');
-            self.memory.write8(name_at + 3, '0' + @as(u8, @intCast(oi & 7)));
-            self.memory.write8(name_at + 4, 0);
-            name_at += 5;
-            prev = lm;
-        }
-        // __first_link[0] = head of the chain. (offset 8 already holds the
-        // entry size 20 from the file image; leave it.)
-        self.memory.write32(first + 0, head);
+        // [+0] = &__iob. Leave [+4], [+8] (count), [+0xc] (next) as the file
+        // image / relocations set them.
+        self.memory.write32(first + 0, iob);
+        if (DBG) dbg("__first_link@{x}: [+0]=&__iob={x} [+8]count={x} [+c]next={x}", .{ first, iob, self.memory.read32(first + 8), self.memory.read32(first + 12) });
     }
 
     /// Find a library's exported DATA symbol whose (unbiased) st_value equals
@@ -375,6 +384,91 @@ pub const Linker = struct {
         }
     }
 
+    /// Look up `name` in a library's retained host-side .symtab; return its
+    /// BIASED value and size, or null. Used for INTERNAL data symbols (not in
+    /// .dynsym) such as libc's __iob / _lastbuf / _bufendtab.
+    fn hostSymByName(self: *Linker, obj: *const Object, name: []const u8) ?struct { addr: u32, size: u32 } {
+        _ = self;
+        const sym = obj.lsym;
+        const str = obj.lstr;
+        if (sym.len == 0) return null;
+        const n = sym.len / SYMENT;
+        var i: usize = 1; // skip the null symbol
+        while (i < n) : (i += 1) {
+            const o = i * SYMENT;
+            const st_name = rd32(sym, o + 0);
+            const st_shndx = std.mem.readInt(u16, sym[o + 14 ..][0..2], .big);
+            if (st_shndx == SHN_UNDEF or st_shndx == SHN_ABS or st_name == 0) continue;
+            if (st_name >= str.len) continue;
+            // Compare the strtab name to `name`.
+            var k: usize = 0;
+            while (k < name.len) : (k += 1) {
+                if (st_name + k >= str.len or str[st_name + k] != name[k]) break;
+            }
+            if (k == name.len and st_name + k < str.len and str[st_name + k] == 0) {
+                return .{ .addr = rd32(sym, o + 4) +% obj.bias, .size = rd32(sym, o + 8) };
+            }
+        }
+        return null;
+    }
+
+    /// Pass 3b: for every symbol the executable COPY-relocated into its .bss
+    /// (recorded in preempt_names -> exe_addr), redirect any library GOT/data
+    /// slot that RELATIVE-points into that symbol's LIBRARY-side storage to the
+    /// executable's copy, preserving the intra-object offset.
+    ///
+    /// This closes the gap preemptLibraryData can't: libc references its own
+    /// __iob / _lastbuf / _bufendtab through nameless RELATIVE GOT slots, and
+    /// those symbols live in libc's .symtab (not .dynsym), so name/dynsym-based
+    /// preemption never matched them. Without this, libc's stdio (fflush) walks
+    /// its own uninitialized FILE table instead of the exe's, and a program's
+    /// buffered output to a pipe/file is silently dropped (e.g. `tr`).
+    fn preemptCopyRelocRanges(self: *Linker) void {
+        var pi: usize = 0;
+        while (pi < self.n_preempt) : (pi += 1) {
+            const name = std.mem.sliceTo(&self.preempt_names[pi], 0);
+            const exe_addr = self.preempt_addr[pi];
+            if (DBG) dbg("copy-preempt sym '{s}' exe_addr={x}", .{ name, exe_addr });
+            // For each library, find its own copy of this symbol (addr+size).
+            var oi: usize = 1; // libraries only
+            while (oi < self.n_objs) : (oi += 1) {
+                const obj = &self.objs[oi];
+                if (DBG) dbg("  obj{d} lsym.len={d}", .{ oi, obj.lsym.len });
+                const libsym = self.hostSymByName(obj, name) orelse continue;
+                if (DBG) dbg("  found lib copy addr={x} size={x}", .{ libsym.addr, libsym.size });
+                const lo = libsym.addr;
+                const hi = libsym.addr +% libsym.size;
+                if (hi <= lo) continue;
+                self.redirectSlotsInRange(obj, lo, hi, exe_addr);
+            }
+        }
+    }
+
+    /// Rewrite every RELATIVE-relocated GOT/data slot in `obj` whose current
+    /// value is in [lo, hi) to `exe_addr + (value - lo)`. Scans the object's
+    /// RELA and JMPREL tables for R_88K_RELATIVE entries (the slots libc fills
+    /// with pointers to its own data).
+    fn redirectSlotsInRange(self: *Linker, obj: *const Object, lo: u32, hi: u32, exe_addr: u32) void {
+        const tables = [_]struct { addr: u32, size: u32 }{
+            .{ .addr = obj.rela, .size = obj.relasz },
+            .{ .addr = obj.jmprel, .size = obj.pltrelsz },
+        };
+        for (tables) |t| {
+            if (t.addr == 0 or t.size == 0) continue;
+            var off: u32 = 0;
+            while (off < t.size) : (off += 12) {
+                const r_info = self.memory.read32(t.addr + off + 4);
+                if ((r_info & 0xff) != R_88K_RELATIVE) continue;
+                const slot = self.memory.read32(t.addr + off + 0) +% obj.bias;
+                const cur = self.memory.read32(slot);
+                if (cur < lo or cur >= hi) continue;
+                const newv = exe_addr +% (cur -% lo);
+                self.memory.write32(slot, newv);
+                if (DBG) dbgPreempt("copyrange", slot, cur, newv);
+            }
+        }
+    }
+
     fn copyName(self: *Linker, obj: *const Object, name_off: u32, out: []u8) usize {
         var i: usize = 0;
         while (i < out.len) : (i += 1) {
@@ -419,7 +513,15 @@ pub fn link(
     main_dynamic_vaddr: u32,
     main_brk: u32,
 ) Error!void {
-    var lk = Linker{ .memory = memory, .fs = fs };
+    var lk = Linker{ .memory = memory, .fs = fs, .gpa = gpa };
+    // Free any retained library .symtab/.strtab copies once linking is done.
+    defer {
+        var fi: usize = 0;
+        while (fi < lk.n_objs) : (fi += 1) {
+            if (lk.objs[fi].lsym.len != 0) gpa.free(@constCast(lk.objs[fi].lsym));
+            if (lk.objs[fi].lstr.len != 0) gpa.free(@constCast(lk.objs[fi].lstr));
+        }
+    }
 
     // Object 0: the main executable (bias 0).
     lk.objs[0] = .{ .bias = 0, .dynamic_vaddr = main_dynamic_vaddr };
@@ -472,12 +574,19 @@ pub fn link(
     // vaddr to a library symbol's st_value, then look the name up in the exe.
     lk.preemptLibraryData();
 
+    // Pass 3b: redirect library GOT/data slots that RELATIVE-point at a
+    // library's OWN copy of an exe-COPY-relocated symbol (e.g. libc's internal
+    // __iob / _lastbuf / _bufendtab, which are in libc's .symtab, not .dynsym)
+    // to the executable's copy. Without this, libc's stdio operates on its own
+    // uninitialized FILE table and buffered pipe/file output is dropped.
+    lk.preemptCopyRelocRanges();
+
     // Build the runtime-linker link_map chain and publish it where libc's
     // startup expects it. The SysV/88 shared libc (which is also the
     // interpreter) walks a chain of `struct link_map` (link.h) rooted at
     // `__first_link[0]`; e.g. fflush iterates it to flush every object's FILE
     // table. We synthesize the chain the real ld.so would have built.
-    try lk.buildLinkMap();
+    try lk.initStdioRegistry();
 
     // Initialize libc's break-tracking global `_nd` (the userland "current
     // break" that _sbrk/_brk read/write) to the true initial break. The real
@@ -531,6 +640,17 @@ fn loadLibrary(lk: *Linker, guest_path: []const u8, io: std.Io, gpa: std.mem.All
     const obj = elf.mapSegments(lk.memory, image, bias) catch return error.LoadOutOfRange;
     lk.objs[lk.n_objs] = .{ .bias = bias, .dynamic_vaddr = obj.dynamic_vaddr };
     lk.readDynamic(&lk.objs[lk.n_objs]);
+    // Retain the library's .symtab/.strtab (non-ALLOC, so not in guest memory)
+    // so pass 3 can resolve internal data symbols (libc __iob/_lastbuf/...).
+    // Best-effort: on OOM or absence, leave the slices empty.
+    if (elf.findSymtab(image)) |ss| {
+        if (gpa.dupe(u8, ss.sym)) |symbuf| {
+            if (gpa.dupe(u8, ss.str)) |strbuf| {
+                lk.objs[lk.n_objs].lsym = symbuf;
+                lk.objs[lk.n_objs].lstr = strbuf;
+            } else |_| gpa.free(symbuf);
+        } else |_| {}
+    }
     lk.n_objs += 1;
     rememberLoaded(guest_path);
 }

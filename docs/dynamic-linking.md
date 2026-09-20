@@ -170,3 +170,49 @@ through nono.
    entry, letting it do all linking. Most faithful, heaviest.
 
 Static binaries (echo/cat/pwd/ls) are unaffected and continue to work.
+
+
+## RESOLVED: stdio exit-flush — `__first_link` is the FILE registry, not a link_map
+
+Dynamically-linked programs that write via buffered stdio to a **pipe or file**
+(block-buffered, so nothing is written until the exit-time flush) lost all
+output: `tr` produced nothing through a pipe; `size`/`nm` only worked on a tty
+(line-buffered). Root-caused precisely against the binaries + nono/difftrace:
+
+- At exit, `_cleanup` calls `fflush(NULL)`, which walks a registry rooted at
+  libc's `__first_link` (libc `.symtab`, unbiased 0x617f4). Despite the name,
+  this libc's `__first_link` is **NOT a `struct link_map`** — it is the head of
+  the stdio FILE-flush registry. As fflush reads it:
+    - `[+0]`  `FILE*` — pointer to a FILE array (an object's `__iob`)
+    - `[+8]`  `int`   — number of FILEs in that array (0x14 = 20)
+    - `[+0xc]`        — next registry node (0 = end)
+- The old `buildLinkMap()` modelled `__first_link` as a `struct link_map` and
+  OVERWROTE `[+0]` with a synthesized 20-byte-stride chain at 0x04000000. fflush
+  then walked that as a FILE array — garbage — and flushed nothing (or, for a
+  program with no COPY reloc, `[+0]` was left 0 and fflush dereferenced ~null).
+
+**Fix (`initStdioRegistry`, replaces `buildLinkMap`):** point `[__first_link+0]`
+at the ONE true `__iob` FILE array and leave `[+8]`/`[+0xc]` as the file image /
+relocations set them:
+  - if the executable COPY-relocates `__iob` into its `.bss` (e.g. `tr`,
+    0x42200), that copy is canonical — a library's own `__iob` GOT slot is also
+    redirected to it (see below);
+  - otherwise (e.g. a `cc`-compiled program, `date` — no COPY reloc) point at
+    libc's own `__iob`, found via the library's retained `.symtab` (below).
+
+**Supporting machinery added:**
+- `elf.findSymtab(image)` extracts a library's `.symtab`/`.strtab` byte ranges
+  from its file image (these are non-ALLOC sections, never mapped into guest
+  memory). `Object.lsym`/`.lstr` retain copies (freed at end of `link()`).
+  `hostSymByName()` resolves a library's INTERNAL symbols (`__iob`, `__ctype`,
+  ...) that are absent from `.dynsym`.
+- `preemptCopyRelocRanges()` + `redirectSlotsInRange()`: for each exe
+  COPY-relocated symbol, rewrite any library GOT/data RELATIVE slot pointing
+  INTO that symbol's library-side storage `[libc_copy, +size)` to
+  `exe_copy + same_offset` (preserves e.g. `__iob[1]` = stdout). This is what
+  `preemptLibraryData` couldn't do, because these symbols live in libc's
+  `.symtab`, not `.dynsym`.
+
+**Verified:** `tr` flushes to a pipe (`HELLO`) and a file; `size`/`nm` now work
+to a pipe AND a file (previously tty-only); `date`, `cc`-compiled programs, and
+static tools unaffected. `zig build test` green; musashi difftest 39/39.

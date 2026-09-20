@@ -163,6 +163,33 @@ pub fn dispatch(runner: *machine.Runner) bool {
             sysv.returnSuccess(cpu, 0);
             return true;
         },
+        // syssec: SVR4/88 security (B1/ACL/privilege) subsystem. This userland
+        // is not running the security extensions, so report "not present" —
+        // programs (cat et al. probe it at startup) fall back to standard
+        // UNIX permissions when it fails. ENOSYS-equivalent (ENOPKG=65 on SVR4;
+        // use EINVAL which the low-range mapper passes through cleanly).
+        .syssec => {
+            sysv.returnError(cpu, EINVAL);
+            return true;
+        },
+        // ulimit(cmd, newlimit): SVR4 resource limits.
+        //   1 UL_GFILLIM get file-size limit (in 512-byte blocks)
+        //   2 UL_SFILLIM set file-size limit
+        //   3 UL_GMEMLIM get max break address (process data-size ceiling)
+        //   4 UL_GDESLIM get max file descriptors
+        // sort/other tools query these at startup to size buffers. Report
+        // generous values consistent with our address space.
+        .ulimit => {
+            const cmd = sysv.arg(cpu, 0);
+            switch (cmd) {
+                1 => sysv.returnSuccess(cpu, 0x0020_0000), // ~1GB / 512 = large file limit in blocks
+                2 => sysv.returnSuccess(cpu, sysv.arg(cpu, 1)), // accept the set, echo it
+                3 => sysv.returnSuccess(cpu, 0x0800_0000), // max break: keep below the mmap region (0x08000000)
+                4 => sysv.returnSuccess(cpu, fsmod.MAX_FD), // max fds
+                else => sysv.returnError(cpu, EINVAL),
+            }
+            return true;
+        },
         .getdents => return sysGetdents(runner),
         // Identity/permission syscalls: report plausible values so libc is happy.
         .getpid => {
@@ -320,7 +347,10 @@ fn sysOpen(runner: *machine.Runner) bool {
     // return the host fd directly. If the target is a directory, also open a
     // dir stream so getdents can read it (the host forbids read(2) on dirs).
     if (fsOf(runner)) |fs| {
-        if (fs.openDir(cpath, hfd)) |gdir| {
+        // Canonicalize the guest path for dir-entry synthesis (getcwd walk).
+        var canonbuf: [1024]u8 = undefined;
+        const gcanon = fs.canonicalGuest(gpath, &canonbuf) orelse gpath;
+        if (fs.openDir(cpath, gcanon, hfd)) |gdir| {
             sysv.returnSuccess(cpu, gdir);
             return true;
         }
@@ -380,7 +410,16 @@ fn sysAccess(runner: *machine.Runner) bool {
         };
         cpath = hp.ptr;
     }
-    if (fsmod.c.access(cpath, @intCast(amode)) < 0) {
+    // SysV/88 access(2) amode: F_OK=0, X_OK=1, W_OK=2, R_OK=4 (same low 3 bits
+    // as Linux). SVR4 also defines EFF_ONLY_OK=8 (test effective ids) and
+    // EX_OK=... higher bits that Linux's access() rejects with EINVAL. Mask to
+    // the R/W/X bits Linux understands; the effective-vs-real distinction is
+    // irrelevant here (we run as a single uid). Without this, the shell's PATH
+    // search (access(cmd, X_OK|EFF_ONLY_OK) = amode 9) always fails EINVAL and
+    // every external command "isn't found".
+    const hmode: c_int = @intCast(amode & 0x7);
+    const arc = fsmod.c.access(cpath, hmode);
+    if (arc < 0) {
         sysv.returnError(cpu, mapErrno(hostErrno()));
     } else {
         sysv.returnSuccess(cpu, 0);
@@ -976,26 +1015,64 @@ fn sysGetdents(runner: *machine.Runner) bool {
     const was = runner.memory.enforce;
     runner.memory.enforce = false;
     defer runner.memory.enforce = was;
+
+    // Emit one SVR4 dirent {d_ino, d_off, d_reclen, d_name}. Returns false if
+    // the record does not fit in the remaining buffer (nothing written).
+    const emit = struct {
+        fn one(rn: *machine.Runner, base: u32, off: *u32, cap: u32, dino: u32, nm: []const u8) bool {
+            const raw = 10 + nm.len + 1;
+            const reclen: u32 = @intCast(std.mem.alignForward(usize, raw, 4));
+            if (off.* + reclen > cap) return false;
+            const at = base + off.*;
+            rn.memory.write32(at + 0, dino); // d_ino
+            rn.memory.write32(at + 4, off.* + reclen); // d_off (next offset)
+            rn.memory.write16(at + 8, @intCast(reclen)); // d_reclen
+            rn.memory.writeBytes(at + 10, nm);
+            rn.memory.write8(at + 10 + @as(u32, @intCast(nm.len)), 0);
+            off.* += reclen;
+            return true;
+        }
+    }.one;
+
+    var real_done = false;
     while (true) {
         var ino: c_ulong = 0;
         var namebuf: [256]u8 = undefined;
         const rc = r88k_dirread(handle, &ino, &namebuf);
-        if (rc <= 0) break; // end of directory
+        if (rc <= 0) {
+            real_done = true;
+            break; // end of directory
+        }
         const name = std.mem.sliceTo(&namebuf, 0);
-        // reclen = header(10) + name + 1 (NUL), padded to 4.
-        const raw = 10 + name.len + 1;
-        const reclen: u32 = @intCast(std.mem.alignForward(usize, raw, 4));
-        if (written + reclen > nbyte) {
+        if (!emit(runner, buf, &written, nbyte, @intCast(ino & 0xffffffff), name)) {
             fs.dirPushback(handle); // didn't fit; re-emit next call
             break;
         }
-        const at = buf + written;
-        runner.memory.write32(at + 0, @intCast(ino & 0xffffffff)); // d_ino
-        runner.memory.write32(at + 4, written + reclen); // d_off (next offset)
-        runner.memory.write16(at + 8, @intCast(reclen)); // d_reclen
-        runner.memory.writeBytes(at + 10, name);
-        runner.memory.write8(at + 10 + @as(u32, @intCast(name.len)), 0);
-        written += reclen;
+    }
+
+    // Once the real stream is exhausted, append synthetic entries for any
+    // mount points that live directly under this directory but are not real
+    // children on the host (e.g. a writable /work overlay on a separate host
+    // fs). Their d_ino is the backing dir's host inode, which matches what
+    // lstat() of the mount point returns — this is what a userland getcwd()
+    // relies on to climb across the mount boundary.
+    if (real_done) {
+        if (fs.dirGuestPath(gfd)) |dirpath| {
+            while (fs.mountChild(dirpath, fs.dirSynthNext(gfd))) |child| {
+                // Skip a mount whose name already appeared as a real host entry
+                // is not needed here: overlays like /work have no real parent
+                // entry. Compute d_ino from the backing dir's host inode.
+                var hs: HostStat = undefined;
+                var rootz: [1024]u8 = undefined;
+                const rn = @min(child.host_root.len, rootz.len - 1);
+                @memcpy(rootz[0..rn], child.host_root[0..rn]);
+                rootz[rn] = 0;
+                r88k_stat(@ptrCast(&rootz), &hs);
+                const dino: u32 = if (hs.ok != 0) hs.ino else 0xffff_fffe;
+                if (!emit(runner, buf, &written, nbyte, dino, child.name)) break;
+                fs.dirSynthAdvance(gfd);
+            }
+        }
     }
     sysv.returnSuccess(cpu, written);
     return true;

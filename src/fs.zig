@@ -55,6 +55,16 @@ pub const Fs = struct {
     host_fd: [MAX_FD]i32,
     /// Directory-stream handle per guest fd (-1 if not a directory).
     dir_handle: [MAX_FD]i32,
+    /// Guest-absolute path of the directory opened on each guest fd (only
+    /// meaningful when dir_handle[gfd] >= 0). Used by getdents to synthesize
+    /// entries for mount points that live directly under this directory, so a
+    /// userland getcwd() walk (getdents(..) + lstat) can cross mount
+    /// boundaries the same way it would on a single real filesystem.
+    dir_path: [MAX_FD][256]u8,
+    dir_path_len: [MAX_FD]usize,
+    /// Index of the next synthetic mount-point entry to emit for this dir fd
+    /// once the real readdir stream is exhausted (see getdents).
+    dir_synth_next: [MAX_FD]usize,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Fs {
@@ -63,11 +73,16 @@ pub const Fs = struct {
             .cwd_len = 1,
             .host_fd = undefined,
             .dir_handle = undefined,
+            .dir_path = undefined,
+            .dir_path_len = undefined,
+            .dir_synth_next = undefined,
             .allocator = allocator,
         };
         fs.cwd[0] = '/';
         for (&fs.host_fd) |*h| h.* = -1;
         for (&fs.dir_handle) |*d| d.* = -1;
+        for (&fs.dir_path_len) |*l| l.* = 0;
+        for (&fs.dir_synth_next) |*s| s.* = 0;
         fs.host_fd[0] = 0;
         fs.host_fd[1] = 1;
         fs.host_fd[2] = 2;
@@ -90,6 +105,13 @@ pub const Fs = struct {
 
     fn cwdSlice(self: *const Fs) []const u8 {
         return self.cwd[0..self.cwd_len];
+    }
+
+    /// Public wrapper over canonicalize() for callers that need the guest-
+    /// absolute, "."/".." collapsed form of a path (e.g. getdents mount-entry
+    /// synthesis). Returns null on error rather than propagating.
+    pub fn canonicalGuest(self: *const Fs, guest_path: []const u8, out: []u8) ?[]const u8 {
+        return self.canonicalize(guest_path, out) catch null;
     }
 
     /// Canonicalize a (possibly relative) guest path into a guest-absolute path
@@ -308,6 +330,8 @@ pub const Fs = struct {
         if (self.dir_handle[gfd] >= 0) {
             r88k_dirclose(self.dir_handle[gfd]);
             self.dir_handle[gfd] = -1;
+            self.dir_path_len[gfd] = 0;
+            self.dir_synth_next[gfd] = 0;
         }
         if (gfd > 2) _ = c.close(h);
         self.host_fd[gfd] = -1;
@@ -315,9 +339,11 @@ pub const Fs = struct {
     }
 
     /// Try to open a directory stream for `host_path` and associate it with an
-    /// allocated guest fd. Returns the guest fd on success, null if it is not a
-    /// directory (caller should proceed with the regular file open).
-    pub fn openDir(self: *Fs, host_path: [*:0]const u8, hfd: i32) ?u32 {
+    /// allocated guest fd. `guest_path` is the guest-absolute directory path
+    /// (used later to synthesize mount-point entries in getdents). Returns the
+    /// guest fd on success, null if it is not a directory (caller should
+    /// proceed with the regular file open).
+    pub fn openDir(self: *Fs, host_path: [*:0]const u8, guest_path: []const u8, hfd: i32) ?u32 {
         const handle = r88k_diropen(host_path);
         if (handle < 0) return null;
         const gfd = self.allocFd(hfd) orelse {
@@ -325,7 +351,59 @@ pub const Fs = struct {
             return null;
         };
         self.dir_handle[gfd] = handle;
+        const n = @min(guest_path.len, self.dir_path[gfd].len);
+        @memcpy(self.dir_path[gfd][0..n], guest_path[0..n]);
+        self.dir_path_len[gfd] = n;
+        self.dir_synth_next[gfd] = 0;
         return gfd;
+    }
+
+    /// Guest-absolute path of the directory opened on `gfd`, or null.
+    pub fn dirGuestPath(self: *const Fs, gfd: u32) ?[]const u8 {
+        if (gfd >= MAX_FD) return null;
+        if (self.dir_handle[gfd] < 0) return null;
+        return self.dir_path[gfd][0..self.dir_path_len[gfd]];
+    }
+
+    /// Read/advance the synthetic mount-entry cursor for a dir fd.
+    pub fn dirSynthNext(self: *const Fs, gfd: u32) usize {
+        if (gfd >= MAX_FD) return 0;
+        return self.dir_synth_next[gfd];
+    }
+    pub fn dirSynthAdvance(self: *Fs, gfd: u32) void {
+        if (gfd >= MAX_FD) return;
+        self.dir_synth_next[gfd] += 1;
+    }
+    pub fn dirSynthRewind(self: *Fs, gfd: u32) void {
+        if (gfd >= MAX_FD) return;
+        if (self.dir_synth_next[gfd] > 0) self.dir_synth_next[gfd] -= 1;
+    }
+
+    /// For a guest-absolute directory `dir`, return the host backing path of
+    /// the `index`-th mount point that lives DIRECTLY under `dir` (i.e. the
+    /// mount's guest_prefix has `dir` as its parent), along with the final path
+    /// component (the entry name). Returns null once `index` is out of range.
+    ///
+    /// This lets getdents present a mount point as a normal child directory so
+    /// a userland getcwd()'s "read the parent, match inodes" walk can climb
+    /// across mount boundaries.
+    pub fn mountChild(self: *const Fs, dir: []const u8, index: usize) ?struct { host_root: []const u8, name: []const u8 } {
+        var seen: usize = 0;
+        for (self.mounts.items) |m| {
+            const p = m.guest_prefix;
+            if (std.mem.eql(u8, p, "/")) continue; // root is never a child
+            // Split p into parent + name at the last '/'.
+            var slash: usize = p.len;
+            while (slash > 0 and p[slash - 1] != '/') slash -= 1;
+            // parent = p[0..slash-1] (drop trailing '/'), or "/" if slash==1.
+            const parent = if (slash <= 1) "/" else p[0 .. slash - 1];
+            const name = p[slash..];
+            if (name.len == 0) continue;
+            if (!std.mem.eql(u8, parent, dir)) continue;
+            if (seen == index) return .{ .host_root = m.host_root, .name = name };
+            seen += 1;
+        }
+        return null;
     }
 
     pub fn dirHandleFor(self: *const Fs, gfd: u32) ?c_int {
