@@ -13,8 +13,21 @@ const std = @import("std");
 const machine = @import("../machine.zig");
 const mem = @import("../mem.zig");
 const fsmod = @import("../fs.zig");
+const procmodel = @import("../procmodel.zig");
 const obsd = @import("../abi/openbsd.zig");
 const Syscall = @import("table_openbsd.zig").Syscall;
+
+extern "c" fn getpid() c_int;
+extern "c" fn getppid() c_int;
+extern "c" fn dup(fd: c_int) c_int;
+extern "c" fn dup2(oldfd: c_int, newfd: c_int) c_int;
+
+fn pmOf(runner: *machine.Runner) ?*procmodel.HostProcess {
+    const p = runner.procmodel orelse return null;
+    return @ptrCast(@alignCast(p));
+}
+
+const ECHILD: u32 = 10;
 
 // Host libc primitives (same set the SysV dispatcher uses).
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
@@ -46,6 +59,7 @@ const EFAULT: u32 = 14;
 const EINVAL: u32 = 22;
 const ENOTTY: u32 = 25;
 const ENOSYS: u32 = 78; // OpenBSD ENOSYS = 78 (function not implemented)
+const EINTR: u32 = 4; // interrupted system call
 
 fn fsOf(runner: *machine.Runner) ?*fsmod.Fs {
     if (runner.fs) |p| return @ptrCast(@alignCast(p));
@@ -136,6 +150,18 @@ pub fn dispatch(runner: *machine.Runner) bool {
             obsd.returnSuccess(cpu, 0);
             return true;
         },
+        .sigaction => return sysSigaction(runner),
+        .sigreturn => return sysSigreturn(runner),
+        // Mask/altstack/pending: accept (we deliver only SIGCHLD, unmasked).
+        .sigprocmask, .sigaltstack, .sigpending => {
+            obsd.returnSuccess(cpu, 0);
+            return true;
+        },
+        // sigsuspend blocks until a signal. A shell/make uses it to wait for
+        // SIGCHLD: it blocks here until a child exits, its SIGCHLD handler runs
+        // (reaps + records), then it returns EINTR. We deliver SIGCHLD to the
+        // registered handler when a child is reapable, then return EINTR.
+        .sigsuspend => return sysSigsuspend(runner),
         // getentropy(buf, len): fill with a deterministic pattern (we're not
         // cryptographic; the guest just needs the bytes present).
         .getentropy => {
@@ -169,12 +195,75 @@ pub fn dispatch(runner: *machine.Runner) bool {
             obsd.returnSuccess(cpu, 0); // not set-uid/gid
             return true;
         },
+        .getgroups => {
+            // getgroups(gidsetlen, gidset): report membership in group 0 only.
+            const len = obsd.arg(cpu, 0);
+            const set = obsd.arg(cpu, 1);
+            if (len >= 1 and set != 0 and @as(u64, set) + 4 <= mem.Memory.size) {
+                const was = runner.memory.enforce;
+                runner.memory.enforce = false;
+                runner.memory.write32(set, 0);
+                runner.memory.enforce = was;
+            }
+            obsd.returnSuccess(cpu, 1); // one group (gid 0)
+            return true;
+        },
+        .getlogin_r => {
+            // getlogin_r(namebuf, namelen): copy a fixed login name.
+            const buf = obsd.arg(cpu, 0);
+            const len = obsd.arg(cpu, 1);
+            const name = "root";
+            if (buf != 0 and len >= name.len + 1 and @as(u64, buf) + name.len + 1 <= mem.Memory.size) {
+                const was = runner.memory.enforce;
+                runner.memory.enforce = false;
+                runner.memory.writeBytes(buf, name);
+                runner.memory.write8(buf + @as(u32, name.len), 0);
+                runner.memory.enforce = was;
+            }
+            obsd.returnSuccess(cpu, 0);
+            return true;
+        },
         .getpid => {
-            obsd.returnSuccess(cpu, 1);
+            // Real host pid: fork() returns real child pids, so getpid must
+            // agree for make's job tracking to line up.
+            obsd.returnSuccess(cpu, @intCast(getpid()));
+            return true;
+        },
+        .getppid => {
+            obsd.returnSuccess(cpu, @intCast(getppid()));
             return true;
         },
         .getthrid => {
             obsd.returnSuccess(cpu, 1); // single thread, tid 1
+            return true;
+        },
+        .getrusage => {
+            // Zero-fill the rusage struct (arg1); we don't track resource use.
+            const ru = obsd.arg(cpu, 1);
+            if (ru != 0 and @as(u64, ru) + 72 <= mem.Memory.size) {
+                const was = runner.memory.enforce;
+                runner.memory.enforce = false;
+                runner.memory.zero(ru, 72);
+                runner.memory.enforce = was;
+            }
+            obsd.returnSuccess(cpu, 0);
+            return true;
+        },
+        // Process-group / session job control: we run a flat process model, so
+        // report/accept sensibly. getpgid/getpgrp/getsid -> group 1; setpgid/
+        // setsid -> success.
+        .getpgid, .getpgrp, .getsid => {
+            obsd.returnSuccess(cpu, 1);
+            return true;
+        },
+        .setpgid, .setsid => {
+            obsd.returnSuccess(cpu, 0);
+            return true;
+        },
+        .kill, .thrkill => {
+            // We don't deliver guest signals; accept the request. (make sends
+            // SIGCONT/SIGTERM to job groups during scheduling.)
+            obsd.returnSuccess(cpu, 0);
             return true;
         },
         .gettimeofday => return sysGettimeofday(runner),
@@ -186,6 +275,12 @@ pub fn dispatch(runner: *machine.Runner) bool {
         .__getcwd => return sysGetcwd(runner),
         .chdir => return sysChdir(runner),
         .fchdir => return sysFchdir(runner),
+        .fork, .vfork => return sysFork(runner),
+        .execve => return sysExec(runner),
+        .wait4 => return sysWait4(runner),
+        .pipe, .pipe2 => return sysPipe(runner),
+        .dup => return sysDup(runner),
+        .dup2, .dup3 => return sysDup2(runner),
         .access => return sysAccess(runner),
         .fcntl => return sysFcntl(runner),
         .mmap => return sysMmap(runner),
@@ -389,8 +484,6 @@ fn sysLseek(runner: *machine.Runner) bool {
 }
 
 extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, off: c_long) isize;
-extern "c" fn dup(fd: c_int) c_int;
-
 // OpenBSD fcntl commands (fcntl.h).
 const F_DUPFD: u32 = 0;
 const F_GETFD: u32 = 1;
@@ -439,6 +532,7 @@ fn sysFcntl(runner: *machine.Runner) bool {
 // OpenBSD mmap flags (sys/mman.h).
 const OBSD_MAP_ANON: u32 = 0x1000;
 const OBSD_MAP_PRIVATE: u32 = 0x0002;
+const OBSD_MAP_FIXED: u32 = 0x0010;
 
 /// mmap(addr, len, prot, flags, fd, pad, off) — m88k register ABI.
 /// Anonymous maps (the crt/malloc case) are served from the downward bump
@@ -616,12 +710,16 @@ fn sysFchdir(runner: *machine.Runner) bool {
 
 fn sysMmap(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
+    const addr = obsd.arg(cpu, 0);
     const len = obsd.arg(cpu, 1);
     const flags = obsd.arg(cpu, 3);
     const gfd = obsd.arg(cpu, 4);
-    // off_t is 64-bit; with the `pad` slot the low word is arg6. Only used for
-    // file-backed maps.
-    const off = obsd.arg(cpu, 6);
+    // mmap(addr,len,prot,flags,fd,offset): off_t is 64-bit in the even/odd
+    // register pair r8:r9 (r7 is skipped as the alignment pad). So
+    // off_hi = arg6 (r8), off_lo = arg7 (r9). We use the low word (mapped
+    // files are < 4GB). Reading arg6 as the whole offset (the earlier bug) made
+    // every library segment load from offset 0 -> garbage DYNAMIC.
+    const off = obsd.arg(cpu, 7);
 
     const anon = (flags & OBSD_MAP_ANON) != 0 or gfd == 0xffffffff;
     var hfd: c_int = -1;
@@ -639,12 +737,26 @@ fn sysMmap(runner: *machine.Runner) bool {
         return true;
     }
     const size = std.mem.alignForward(u32, if (len == 0) 1 else len, 0x1000);
-    if (runner.mmap_next < runner.brk + 0x10000 or runner.mmap_next -% size < runner.brk) {
-        obsd.returnError(cpu, ENOMEM);
-        return true;
+
+    // Choose the mapping address. MAP_FIXED (or a non-zero addr hint we can
+    // satisfy) must land EXACTLY where requested: ld.so reserves a library's
+    // whole address span, then maps each segment at a computed fixed offset and
+    // writes relocations there — a wrong address corrupts everything. Otherwise
+    // use the downward bump allocator.
+    var base: u32 = undefined;
+    if (addr != 0 and (@as(u64, addr) + size) <= mem.Memory.size and
+        ((flags & OBSD_MAP_FIXED) != 0 or addr >= runner.brk))
+    {
+        base = addr;
+    } else {
+        if (runner.mmap_next < runner.brk + 0x10000 or runner.mmap_next -% size < runner.brk) {
+            obsd.returnError(cpu, ENOMEM);
+            return true;
+        }
+        base = runner.mmap_next -% size;
+        runner.mmap_next = base;
     }
-    const base = runner.mmap_next -% size;
-    runner.mmap_next = base;
+
     const was = runner.memory.enforce;
     runner.memory.enforce = false;
     runner.memory.zero(base, size);
@@ -954,6 +1066,72 @@ fn sysSysctl(runner: *machine.Runner) bool {
         return true;
     }
 
+    // String keys uname(1)/libc query. Write the string (NUL-terminated) into
+    // oldp honoring oldlenp, and report the length.
+    const putStr = struct {
+        fn go(rn: *machine.Runner, op: u32, olp: u32, s: []const u8) void {
+            const mm = rn.memory;
+            const was = mm.enforce;
+            mm.enforce = false;
+            const need: u32 = @intCast(s.len + 1);
+            if (olp != 0) {
+                const cap = mm.read32(olp);
+                if (op != 0 and cap >= need) {
+                    mm.writeBytes(op, s);
+                    mm.write8(op + @as(u32, @intCast(s.len)), 0);
+                }
+                mm.write32(olp, need);
+            }
+            mm.enforce = was;
+            obsd.returnSuccess(&rn.cpu, 0);
+        }
+    }.go;
+
+    const HW_MACHINE: u32 = 1;
+    const HW_MODEL: u32 = 2;
+    const KERN_OSREV: u32 = 3;
+    const KERN_VERSION: u32 = 4;
+    if (top == CTL_KERN and sub == KERN_OSTYPE) {
+        putStr(runner, oldp, oldlenp, "OpenBSD");
+        return true;
+    }
+    if (top == CTL_KERN and sub == KERN_OSRELEASE) {
+        putStr(runner, oldp, oldlenp, "7.1");
+        return true;
+    }
+    if (top == CTL_KERN and sub == KERN_VERSION) {
+        putStr(runner, oldp, oldlenp, "OpenBSD 7.1 (GENERIC) #1\n");
+        return true;
+    }
+    if (top == CTL_KERN and sub == KERN_OSREV) {
+        putInt(runner, oldp, oldlenp, 202111);
+        return true;
+    }
+    if (top == CTL_KERN and sub == 10) { // KERN_HOSTNAME
+        putStr(runner, oldp, oldlenp, "luna88k");
+        return true;
+    }
+    if (top == CTL_KERN and sub == 22) { // KERN_DOMAINNAME
+        putStr(runner, oldp, oldlenp, "");
+        return true;
+    }
+    if (top == CTL_HW and sub == HW_MACHINE) {
+        putStr(runner, oldp, oldlenp, "luna88k");
+        return true;
+    }
+    if (top == CTL_HW and sub == HW_MODEL) {
+        putStr(runner, oldp, oldlenp, "LUNA-88K");
+        return true;
+    }
+    const CTL_VM: u32 = 2;
+    const VM_MALLOC_CONF: u32 = 12;
+    if (top == CTL_VM and sub == VM_MALLOC_CONF) {
+        // Empty malloc config: an empty NUL-terminated string, len 1. Returning
+        // an uninitialized buffer makes libc malloc warn "unknown char".
+        putStr(runner, oldp, oldlenp, "");
+        return true;
+    }
+
     // Unknown key: report "0 bytes available" and succeed, so callers that
     // probe a length or tolerate an empty result proceed. (Refine per-key as
     // specific tools need real values.)
@@ -978,6 +1156,348 @@ fn sysIoctl(runner: *machine.Runner) bool {
         obsd.returnSuccess(cpu, 0);
     } else {
         obsd.returnError(cpu, ENOTTY);
+    }
+    return true;
+}
+
+// --- signal delivery (minimal: SIGCHLD for shell/make child-wait) ---------
+//
+// OpenBSD's sh/make block in sigsuspend() waiting for SIGCHLD, whose handler
+// reaps the child. We record the handler (sigaction), and when a child is
+// reapable we DELIVER the signal: save the CPU state into a private sigcontext
+// on the guest stack, set r2=signo and r1=an injected trampoline that issues
+// sigreturn, and jump to the handler. sigreturn restores the saved state.
+//
+// We use our OWN sigcontext layout (delivery and sigreturn are both ours; the
+// handler only reads r2/reaps and never inspects the context), so we sidestep
+// OpenBSD's cookie-protected kernel sigcontext entirely.
+
+const SIGCHLD: u32 = 20;
+
+// Our private sigcontext, written on the guest stack at delivery:
+//   [0]   magic (validates sigreturn)
+//   [1]   saved pc
+//   [2]   saved npc
+//   [3]   saved psr
+//   [4]   saved cf
+//   [5]   branch_pending (0/1)
+//   [6]   branch_target
+//   [7..38]  r0..r31 (32 words)
+// total 39 words = 156 bytes.
+const SC_MAGIC: u32 = 0x5311_5347; // "r88kSIG"-ish
+const SC_WORDS: u32 = 39;
+
+fn sysSigaction(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const signo = obsd.arg(cpu, 0);
+    const act = obsd.arg(cpu, 1); // struct sigaction* {handler@0, mask@4, flags@8}
+    const oact = obsd.arg(cpu, 2);
+    // Report the previous handler if asked.
+    if (oact != 0 and signo < 64 and @as(u64, oact) + 12 <= mem.Memory.size) {
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        runner.memory.write32(oact + 0, runner.sig_handlers[signo]);
+        runner.memory.enforce = was;
+    }
+    if (act != 0 and signo < 64) {
+        const h = runner.memory.read32(act + 0);
+        // 0 = SIG_DFL, 1 = SIG_IGN: treat both as "no user handler".
+        runner.sig_handlers[signo] = if (h <= 1) 0 else h;
+    }
+    obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// Deliver SIGCHLD to the guest handler (if registered), returning true if a
+/// signal frame was pushed (PC now points at the handler). The pending syscall
+/// that triggered delivery must NOT also write a return value.
+fn deliverSigchld(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const handler = runner.sig_handlers[SIGCHLD];
+    if (handler == 0) return false;
+
+    // Push our sigcontext below the current SP (16-byte aligned).
+    var sp = cpu.getReg(31);
+    sp -%= SC_WORDS * 4;
+    sp &= ~@as(u32, 15);
+    if (sp < 0x0100_0000) return false; // stack underflow guard
+
+    const m = runner.memory;
+    const was = m.enforce;
+    m.enforce = false;
+    m.write32(sp + 0, SC_MAGIC);
+    m.write32(sp + 4, cpu.pc);
+    m.write32(sp + 8, cpu.npc);
+    m.write32(sp + 12, cpu.psr);
+    m.write32(sp + 16, cpu.cf);
+    m.write32(sp + 20, if (cpu.branch_pending) 1 else 0);
+    m.write32(sp + 24, cpu.branch_target);
+    var i: u5 = 0;
+    while (true) {
+        m.write32(sp + 28 + @as(u32, i) * 4, cpu.getReg(i));
+        if (i == 31) break;
+        i += 1;
+    }
+    m.enforce = was;
+
+    // Enter the handler: r2 = signo, r3 = 0 (siginfo), r4 = &sigcontext,
+    // r1 = trampoline (issues sigreturn), r31 = new sp, PC = handler.
+    cpu.setReg(2, SIGCHLD);
+    cpu.setReg(3, 0);
+    cpu.setReg(4, sp);
+    cpu.setReg(1, runner.sig_tramp);
+    cpu.setReg(31, sp);
+    cpu.branch_pending = false;
+    cpu.pc = handler;
+    cpu.npc = handler +% 4;
+    return true;
+}
+
+/// sigreturn(scp): restore CPU state from our sigcontext. Validates our magic.
+fn sysSigreturn(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const scp = obsd.arg(cpu, 0);
+    const m = runner.memory;
+    if (@as(u64, scp) + SC_WORDS * 4 > mem.Memory.size or m.read32(scp) != SC_MAGIC) {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    }
+    const pc = m.read32(scp + 4);
+    const npc = m.read32(scp + 8);
+    const psr = m.read32(scp + 12);
+    const cf = m.read32(scp + 16);
+    const bp = m.read32(scp + 20);
+    const bt = m.read32(scp + 24);
+    var i: u5 = 0;
+    while (true) {
+        cpu.setReg(i, m.read32(scp + 28 + @as(u32, i) * 4));
+        if (i == 31) break;
+        i += 1;
+    }
+    cpu.psr = psr;
+    cpu.cf = @truncate(cf);
+    cpu.branch_pending = bp != 0;
+    cpu.branch_target = bt;
+    cpu.pc = pc;
+    cpu.npc = npc;
+    // Do NOT touch r2 or advance PC: we restored the exact pre-signal state,
+    // which resumes the interrupted sigsuspend's return path.
+    return true;
+}
+
+/// sigsuspend: block until SIGCHLD. If a child is reapable and a handler is
+/// registered, deliver the signal (jump to handler; it reaps via wait4 and
+/// returns through the trampoline -> sigreturn). Then the sigsuspend syscall
+/// returns EINTR. If no child is ready yet, block on a real wait so we don't
+/// spin, then deliver.
+fn sysSigsuspend(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        obsd.returnError(cpu, EINTR);
+        return true;
+    };
+    // If a handler is registered and a child is (or becomes) reapable, deliver
+    // SIGCHLD. We set the syscall's return (EINTR) FIRST, so that when the
+    // handler returns via sigreturn and resumes right after the trap, the
+    // sigsuspend call sees EINTR.
+    if (runner.sig_handlers[SIGCHLD] != 0) {
+        // Deliver SIGCHLD only if a child is reapable RIGHT NOW. If a child is
+        // still running, block until it becomes reapable, then deliver. If
+        // there are NO children at all, don't deliver (nothing to report) —
+        // just return EINTR so the caller's wait loop re-checks and exits.
+        var ready = pm.childReapable();
+        if (!ready and pm.hasChildren()) {
+            ready = pm.blockUntilChild();
+        }
+        // Set the sigsuspend return (EINTR) into the CURRENT frame FIRST, so the
+        // saved sigcontext resumes with EINTR after the handler's sigreturn.
+        obsd.returnError(cpu, EINTR);
+        if (ready) _ = deliverSigchld(runner); // PC now at handler if delivered
+        return true;
+    }
+    obsd.returnError(cpu, EINTR);
+    return true;
+}
+
+// --- process model: fork / execve / wait4 / pipe / dup2 -------------------
+
+/// fork/vfork. OpenBSD's raw fork(2) stub is a plain skip-on-success trap with
+/// NO r3 dual-return (unlike SysV/88): the kernel returns the child pid in r2
+/// to the parent and **0 in r2 to the child**. So we mirror that directly.
+fn sysFork(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    const rc = pm.doFork() catch {
+        obsd.returnError(cpu, ENOMEM);
+        return true;
+    };
+    if (rc == 0) {
+        obsd.returnSuccess(cpu, 0); // child sees 0
+    } else {
+        obsd.returnSuccess(cpu, rc); // parent sees the child pid
+    }
+    return true;
+}
+
+fn sysExec(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    const path_ptr = obsd.arg(cpu, 0);
+    const argv_ptr = obsd.arg(cpu, 1);
+    const envp_ptr = obsd.arg(cpu, 2);
+    var pbuf: [1024]u8 = undefined;
+    const path = readGuestPath(runner, path_ptr, &pbuf) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    var argv_store: [128][]const u8 = undefined;
+    var envp_store: [256][]const u8 = undefined;
+    var argv_bufs: [128][256]u8 = undefined;
+    var envp_bufs: [256][256]u8 = undefined;
+    const argc = readStrVec(runner, argv_ptr, &argv_store, &argv_bufs);
+    const envc = readStrVec(runner, envp_ptr, &envp_store, &envp_bufs);
+    pm.doExec(path, argv_store[0..argc], envp_store[0..envc]) catch {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    };
+    // doExec (setupOpenbsd) already set PC to the new entry; just clear any
+    // stale fault from the reload and continue (no PC advance / carry touch).
+    runner.memory.clearFault();
+    runner.exec_pending = true;
+    return true;
+}
+
+fn readStrVec(runner: *machine.Runner, vec_ptr: u32, out: [][]const u8, bufs: anytype) usize {
+    if (vec_ptr == 0) return 0;
+    var n: usize = 0;
+    while (n < out.len) {
+        const p = runner.memory.read32(vec_ptr + @as(u32, @intCast(n)) * 4);
+        if (p == 0) break;
+        const s = runner.memory.readCStr(p, bufs[n][0 .. bufs[n].len - 1]);
+        bufs[n][s.len] = 0;
+        out[n] = bufs[n][0..s.len];
+        n += 1;
+    }
+    return n;
+}
+
+/// wait4(pid, status, options, rusage): OpenBSD's wait primitive. Returns the
+/// reaped pid in r2 and writes the status word to *status.
+fn sysWait4(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        obsd.returnError(cpu, ECHILD);
+        return true;
+    };
+    const statptr = obsd.arg(cpu, 1);
+    // NOTE: we IGNORE WNOHANG and always block. A shell/make polls for child
+    // exit via sigsuspend(SIGCHLD)+wait4(WNOHANG), but we don't deliver signals,
+    // so a non-blocking wait would spin forever. Blocking here reaps the child
+    // on the first call. (Parallel-job semantics are thereby serialized, which
+    // is acceptable — correctness over concurrency.)
+    const res = pm.doWaitOpts(false) catch {
+        obsd.returnError(cpu, ECHILD);
+        return true;
+    };
+    // WNOHANG with no child ready: return pid 0, don't write status.
+    if (res.pid != 0 and statptr != 0 and @as(u64, statptr) + 4 <= mem.Memory.size) {
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        runner.memory.write32(statptr, res.status);
+        runner.memory.enforce = was;
+    }
+    obsd.returnSuccess(cpu, res.pid);
+    return true;
+}
+
+/// pipe(fildes) / pipe2(fildes, flags): OpenBSD returns the two fds by WRITING
+/// them into the user int[2] array (arg0), and returns 0 — unlike SysV which
+/// returns them in r2/r3.
+fn sysPipe(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    const arr = obsd.arg(cpu, 0);
+    const fds = pm.doPipe() catch {
+        obsd.returnError(cpu, ENOMEM);
+        return true;
+    };
+    if (@as(u64, arr) + 8 > mem.Memory.size) {
+        obsd.returnError(cpu, EFAULT);
+        return true;
+    }
+    const was = runner.memory.enforce;
+    runner.memory.enforce = false;
+    runner.memory.write32(arr + 0, fds[0]);
+    runner.memory.write32(arr + 4, fds[1]);
+    runner.memory.enforce = was;
+    obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysDup(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gfd = obsd.arg(cpu, 0);
+    const hfd = hostFd(runner, gfd) orelse {
+        obsd.returnError(cpu, EBADF);
+        return true;
+    };
+    const hnew = dup(hfd);
+    if (hnew < 0) {
+        obsd.returnError(cpu, mapErrno(hostErrno()));
+        return true;
+    }
+    if (fsOf(runner)) |fs| {
+        const gnew = fs.allocFd(hnew) orelse {
+            obsd.returnError(cpu, EBADF);
+            return true;
+        };
+        obsd.returnSuccess(cpu, gnew);
+    } else {
+        obsd.returnSuccess(cpu, @intCast(hnew));
+    }
+    return true;
+}
+
+/// dup2(oldfd, newfd) / dup3(oldfd, newfd, flags): duplicate onto a specific
+/// guest fd. The shell relies on this for stdio redirection.
+fn sysDup2(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gold = obsd.arg(cpu, 0);
+    const gnew = obsd.arg(cpu, 1);
+    const holdfd = hostFd(runner, gold) orelse {
+        obsd.returnError(cpu, EBADF);
+        return true;
+    };
+    if (gold == gnew) {
+        obsd.returnSuccess(cpu, gnew);
+        return true;
+    }
+    const fs = fsOf(runner) orelse {
+        // No fs table: fall back to a host dup2 with identity fds.
+        if (dup2(holdfd, @intCast(gnew)) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, gnew);
+        return true;
+    };
+    // Close whatever occupied newfd, then point it at a dup of oldfd's host fd.
+    _ = fs.closeFd(gnew);
+    const hnew = dup(holdfd);
+    if (hnew < 0) {
+        obsd.returnError(cpu, mapErrno(hostErrno()));
+        return true;
+    }
+    if (fs.allocFdAt(gnew, hnew)) {
+        obsd.returnSuccess(cpu, gnew);
+    } else {
+        _ = dup2(holdfd, holdfd); // no-op; cleanup path
+        obsd.returnError(cpu, EBADF);
     }
     return true;
 }

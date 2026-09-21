@@ -119,6 +119,29 @@ pub fn findSymtab(image: []const u8) ?SymtabSlices {
     return null;
 }
 
+/// Return the PT_INTERP interpreter path (e.g. "/usr/libexec/ld.so") from a
+/// file image, or null if the object has no interpreter (static). The slice
+/// points into `image` and excludes the trailing NUL.
+pub fn interpPath(image: []const u8) ?[]const u8 {
+    if (image.len < 0x34) return null;
+    const e_phoff = rd32(image, 28);
+    const e_phentsize = rd16(image, 42);
+    const e_phnum = rd16(image, 44);
+    var i: usize = 0;
+    while (i < e_phnum) : (i += 1) {
+        const ph = e_phoff + i * e_phentsize;
+        if (ph + 32 > image.len) return null;
+        if (rd32(image, ph + 0) != PT_INTERP) continue;
+        const p_offset = rd32(image, ph + 4);
+        const p_filesz = rd32(image, ph + 16);
+        if (@as(u64, p_offset) + p_filesz > image.len or p_filesz == 0) return null;
+        var s = image[p_offset .. p_offset + p_filesz];
+        if (s.len > 0 and s[s.len - 1] == 0) s = s[0 .. s.len - 1]; // drop NUL
+        return s;
+    }
+    return null;
+}
+
 /// Validate the ELF header for an m88k big-endian object. Returns nothing on
 /// success; the caller reads e_type etc. directly.
 pub fn checkHeader(image: []const u8) Error!void {

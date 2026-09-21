@@ -64,6 +64,10 @@ pub const Runner = struct {
     /// The active personality's syscall trap vector (SysV/88 = 451). A trap
     /// with this vector is dispatched to `handler`; any other trap is a fault.
     syscall_vector: u32 = 0xffff_ffff,
+    /// A benign cache-control trap vector (m88k `tb0 0,r0,451` cacheflush, used
+    /// by OpenBSD ld.so after writing PLT/relocations). Our memory is coherent,
+    /// so it's a no-op: advance past the trap and continue. 0xffffffff disables.
+    cacheflush_vector: u32 = 0xffff_ffff,
     /// Installed syscall handler. If null, a syscall trap stops the loop.
     handler: ?SyscallFn = null,
     /// Guest filesystem (mount table + fd table). Type-erased to avoid an
@@ -95,6 +99,14 @@ pub const Runner = struct {
     /// Thread control block pointer (OpenBSD __set_tcb/__get_tcb). Holds the
     /// TLS/stack-guard base the guest libc installs at startup.
     tcb: u32 = 0,
+    /// Guest signal-handler table (index = signal number, 0..63). 0 = default
+    /// (no user handler). Recorded by sigaction so the emulator can deliver a
+    /// signal (currently only SIGCHLD, for shell/make child-wait) by pushing a
+    /// sigcontext and jumping to the handler.
+    sig_handlers: [64]u32 = @splat(0),
+    /// Guest address of the signal return trampoline (a small injected stub
+    /// that issues sigreturn). 0 until installed.
+    sig_tramp: u32 = 0,
     /// Set by a successful execve: the run loop must NOT advance PC past the
     /// trap (the handler already set PC to the new image's entry). Cleared by
     /// the run loop after honoring it.
@@ -121,10 +133,13 @@ pub const Runner = struct {
         self.cpu.reset();
     }
 
-    /// Set the program counter (and the delay-slot shadow) to `addr`.
+    /// Set the program counter (and the delay-slot shadow) to `addr`. Also
+    /// clears any pending delayed branch so a stale delay slot from before the
+    /// redirect (e.g. an execve that reloads the image) cannot fire.
     pub fn setPc(self: *Runner, addr: u32) void {
         self.cpu.pc = addr;
         self.cpu.npc = addr +% 4;
+        self.cpu.branch_pending = false;
     }
 
     pub fn getReg(self: *const Runner, index: u5) u32 {
@@ -175,6 +190,14 @@ pub const Runner = struct {
                             // Serviced; the handler set PC. Continue.
                             continue;
                         }
+                    }
+                    if (self.cpu.last_exception == self.cacheflush_vector) {
+                        // Benign cache-flush trap: skip it (coherent memory).
+                        const at = self.cpu.ppc +% 4;
+                        self.cpu.branch_pending = false;
+                        self.cpu.pc = at;
+                        self.cpu.npc = at +% 4;
+                        continue;
                     }
                     // No handler, or a non-syscall trap: a real fault.
                     return .trap;

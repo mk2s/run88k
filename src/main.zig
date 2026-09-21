@@ -131,6 +131,11 @@ pub fn main(init: std.process.Init) !void {
 /// Guest OS personality.
 const Os = enum { sysv88, openbsd };
 
+/// Load base for the OpenBSD interpreter (/usr/libexec/ld.so). Chosen above the
+/// exec + heap and below the mmap bump region (0x08000000) and stack
+/// (0x0c000000). ld.so is ~0x40000 bytes; leave plenty of room.
+const OBSD_LDSO_BASE: u32 = 0x0400_0000;
+
 /// Load and run a guest ELF binary. `path` is the host path to the binary;
 /// `argv` is the guest argument vector (argv[0] = program name). `os_choice`
 /// forces a personality; when null it is auto-detected from the ELF.
@@ -177,6 +182,9 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
         .openbsd => {
             runner.syscall_vector = obsd.syscall_vector;
             runner.handler = &dispatch_openbsd.dispatch;
+            // ld.so uses `tb0 0,r0,451` as a cache-flush after writing PLT/GOT;
+            // treat it as a benign no-op (our memory is coherent).
+            runner.cacheflush_vector = 451;
         },
     }
     if (fs) |*f| runner.fs = f;
@@ -186,42 +194,81 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     var pm: ?procmodel.HostProcess = null;
     if (fs) |*f| {
         pm = procmodel.HostProcess.init(&runner, f, io, gpa);
+        pm.?.openbsd = (os == .openbsd);
         runner.procmodel = &pm.?;
     }
 
-    // Dynamic linking: load NEEDED libraries and apply relocations. Requires a
-    // mount table so the interpreter/libraries resolve.
+    // start_pc is where the guest begins. For a static exec (or the SysV
+    // self-linked path) this is the exec's own entry. For an OpenBSD dynamic
+    // exec we map the interpreter (ld.so) and start THERE; ld.so maps the
+    // libraries and eventually transfers to the exec's AT_ENTRY itself.
+    var start_pc = img.entry;
+    var interp_base: u32 = 0;
+
+    // Dynamic linking.
     if (img.is_dynamic) {
-        if (fs) |*f| {
-            dynamic.reset();
-            dynamic.link(&memory, f, io, gpa, img.dynamic_vaddr, img.brk) catch |e| {
-                outf("run88k: dynamic link failed: {s}\n", .{@errorName(e)});
-                return 126;
-            };
-        } else {
+        if (fs == null) {
             outf("run88k: '{s}' is dynamically linked; pass --root/--mount so libraries resolve\n", .{path});
             return 126;
+        }
+        switch (os) {
+            .sysv88 => {
+                // SysV/88: we self-link (load NEEDED libs + apply relocations).
+                dynamic.reset();
+                dynamic.link(&memory, &fs.?, io, gpa, img.dynamic_vaddr, img.brk) catch |e| {
+                    outf("run88k: dynamic link failed: {s}\n", .{@errorName(e)});
+                    return 126;
+                };
+            },
+            .openbsd => {
+                // OpenBSD: run the guest's real /usr/libexec/ld.so. Map it at a
+                // load base and hand control to its entry; it does the rest.
+                const interp = elf.interpPath(image) orelse "/usr/libexec/ld.so";
+                var hbuf: [2048]u8 = undefined;
+                const hp = fs.?.resolve(interp, &hbuf) catch {
+                    outf("run88k: cannot resolve interpreter '{s}'\n", .{interp});
+                    return 126;
+                };
+                const ldimg = std.Io.Dir.cwd().readFileAlloc(io, hp, gpa, .limited(16 * 1024 * 1024)) catch |e| {
+                    outf("run88k: cannot read interpreter '{s}': {s}\n", .{ interp, @errorName(e) });
+                    return 126;
+                };
+                defer gpa.free(ldimg);
+                const was = memory.enforce;
+                memory.enforce = false;
+                const ldobj = elf.mapSegments(&memory, ldimg, OBSD_LDSO_BASE) catch |e| {
+                    memory.enforce = was;
+                    outf("run88k: cannot map interpreter: {s}\n", .{@errorName(e)});
+                    return 126;
+                };
+                memory.enforce = was;
+                interp_base = OBSD_LDSO_BASE;
+                start_pc = ldobj.entry; // biased ld.so entry
+            },
         }
     }
 
     // Environment: minimal for now.
     const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
     switch (os) {
-        .sysv88 => process.setup(&runner, img.entry, img.brk, argv, &envp) catch |e| {
+        .sysv88 => process.setup(&runner, start_pc, img.brk, argv, &envp) catch |e| {
             outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
             return 126;
         },
         .openbsd => {
-            // OpenBSD's _start walks the ELF aux vector after envp; supply the
-            // entries libc reads (AT_PHDR/PHENT/PHNUM/PAGESZ/ENTRY).
+            // OpenBSD's _start / ld.so walk the ELF aux vector after envp.
+            // AT_BASE is ld.so's load base (0 for a static exec); AT_PHDR/PHENT/
+            // PHNUM/ENTRY always describe the EXEC (never ld.so), so ld.so can
+            // find and start the program it was asked to run.
             const aux = [_]process.AuxEntry{
-                .{ .id = 3, .val = img.phdr_vaddr }, // AUX_phdr
+                .{ .id = 3, .val = img.phdr_vaddr }, // AUX_phdr (exec)
                 .{ .id = 4, .val = img.phent }, // AUX_phent
                 .{ .id = 5, .val = img.phnum }, // AUX_phnum
                 .{ .id = 6, .val = 0x1000 }, // AUX_pagesz
-                .{ .id = 9, .val = img.entry }, // AUX_entry
+                .{ .id = 7, .val = interp_base }, // AUX_base (ld.so, 0 if static)
+                .{ .id = 9, .val = img.entry }, // AUX_entry (exec)
             };
-            process.setupOpenbsd(&runner, img.entry, img.brk, argv, &envp, &aux) catch |e| {
+            process.setupOpenbsd(&runner, start_pc, img.brk, argv, &envp, &aux) catch |e| {
                 outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
                 return 126;
             };

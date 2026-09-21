@@ -21,6 +21,10 @@ const sysv = @import("abi/sysv88.zig");
 const fsmod = @import("fs.zig");
 const dynamic = @import("loaders/dynamic.zig");
 
+/// Load base for the OpenBSD interpreter (/usr/libexec/ld.so). Kept in sync
+/// with main.zig's OBSD_LDSO_BASE.
+pub const OBSD_LDSO_BASE: u32 = 0x0400_0000;
+
 const is_posix = builtin.os.tag != .windows;
 const libc = if (is_posix) struct {
     pub extern "c" fn fork() c_int;
@@ -49,6 +53,9 @@ pub const HostProcess = struct {
     exec_entry: ?u32 = null,
     /// Break for the exec'd image; the dispatcher copies it into the Runner.
     new_brk: u32 = 0,
+    /// True when running an OpenBSD guest: exec must map ld.so + build the ELF
+    /// aux vector + use the stack-based startup instead of the SysV path.
+    openbsd: bool = false,
 
     pub fn init(runner: *machine.Runner, fs: *fsmod.Fs, io: std.Io, gpa: std.mem.Allocator) HostProcess {
         return .{ .runner = runner, .fs = fs, .io = io, .gpa = gpa };
@@ -63,15 +70,61 @@ pub const HostProcess = struct {
         return @intCast(rc);
     }
 
-    /// wait: block for any child; return {pid, SVR status word}.
+    /// wait: reap any child; return {pid, SVR status word}. `nohang` maps to
+    /// WNOHANG — when set and no child has exited yet, returns pid 0 (not an
+    /// error), which is what a job scheduler like make polls for.
     pub fn doWait(self: *HostProcess) ProcError!WaitResult {
+        return self.doWaitOpts(false);
+    }
+    pub fn doWaitOpts(self: *HostProcess, nohang: bool) ProcError!WaitResult {
         _ = self;
         if (!is_posix) return error.NotSupported;
         var status: c_int = 0;
-        const pid = libc.waitpid(-1, &status, 0);
+        const WNOHANG: c_int = 1;
+        const pid = libc.waitpid(-1, &status, if (nohang) WNOHANG else 0);
         if (pid < 0) return error.NoChild;
+        if (pid == 0) return .{ .pid = 0, .status = 0 }; // WNOHANG: none ready
         const exit_code: u32 = (@as(u32, @bitCast(status)) >> 8) & 0xff;
         return .{ .pid = @intCast(pid), .status = (exit_code & 0xff) << 8 };
+    }
+
+    /// Peek whether any child has exited and is reapable, WITHOUT reaping it
+    /// (WNOHANG|WNOWAIT). Used to decide whether to deliver SIGCHLD; the guest's
+    /// handler then calls wait4 to actually reap. Returns true if a child is
+    /// ready. On platforms without WNOWAIT support this still works because we
+    /// only use it as a hint.
+    pub fn childReapable(self: *HostProcess) bool {
+        _ = self;
+        if (!is_posix) return false;
+        var status: c_int = 0;
+        const WNOHANG: c_int = 1;
+        const WNOWAIT: c_int = 8; // don't reap; leave the child waitable
+        const pid = libc.waitpid(-1, &status, WNOHANG | WNOWAIT);
+        return pid > 0;
+    }
+
+    /// Whether the process currently has any children (running or reapable).
+    /// A WNOHANG peek returning ECHILD (-1) means none; 0 or >0 means some.
+    pub fn hasChildren(self: *HostProcess) bool {
+        _ = self;
+        if (!is_posix) return false;
+        var status: c_int = 0;
+        const WNOHANG: c_int = 1;
+        const WNOWAIT: c_int = 8;
+        const pid = libc.waitpid(-1, &status, WNOHANG | WNOWAIT);
+        return pid >= 0; // >=0 means a child exists (0 running, >0 reapable)
+    }
+
+    /// Block until a child is reapable, WITHOUT reaping it (so the guest's
+    /// SIGCHLD handler can wait4 it). Returns true if a child became ready,
+    /// false if there are no children. Used by sigsuspend to avoid spinning.
+    pub fn blockUntilChild(self: *HostProcess) bool {
+        _ = self;
+        if (!is_posix) return false;
+        var status: c_int = 0;
+        const WNOWAIT: c_int = 8; // leave the child waitable for the guest
+        const pid = libc.waitpid(-1, &status, WNOWAIT);
+        return pid > 0;
     }
 
     /// pipe: host pipe(), both ends registered in the guest fd table.
@@ -125,26 +178,60 @@ pub const HostProcess = struct {
         elf.checkHeader(image) catch return error.ExecFailed;
 
         const memory = self.runner.memory;
-        // Fresh address space: drop all regions, then map the new image.
+        // Fresh address space: drop all regions AND wipe the backing RAM, so no
+        // stale code/data from the previous image (e.g. the parent's libc/ld.so
+        // after a fork) lingers at addresses the new image doesn't map.
         memory.clearRegions();
         memory.enforce = false;
+        @memset(memory.bytes, 0);
 
         const img = elf.load(memory, image) catch return error.ExecFailed;
 
-        // Dynamic linking for the new image, if needed.
+        // Reset heap/mmap for the fresh address space.
+        self.runner.brk = img.brk;
+        self.runner.brk_base = img.brk;
+        self.runner.mmap_next = 0x0800_0000;
+
+        if (self.openbsd) {
+            // OpenBSD: run the guest's real ld.so for a dynamic child; static
+            // children start at their own entry. Build the aux vector either
+            // way (ld.so + libc read it).
+            var start_pc = img.entry;
+            var interp_base: u32 = 0;
+            if (img.is_dynamic) {
+                const interp = elf.interpPath(image) orelse "/usr/libexec/ld.so";
+                var ibuf: [2048]u8 = undefined;
+                const ipath = self.fs.resolve(interp, &ibuf) catch return error.ExecFailed;
+                const ldimg = std.Io.Dir.cwd().readFileAlloc(self.io, ipath, self.gpa, .limited(16 * 1024 * 1024)) catch
+                    return error.ExecFailed;
+                defer self.gpa.free(ldimg);
+                const ldobj = elf.mapSegments(memory, ldimg, OBSD_LDSO_BASE) catch return error.ExecFailed;
+                interp_base = OBSD_LDSO_BASE;
+                start_pc = ldobj.entry;
+            }
+            const aux = [_]process.AuxEntry{
+                .{ .id = 3, .val = img.phdr_vaddr },
+                .{ .id = 4, .val = img.phent },
+                .{ .id = 5, .val = img.phnum },
+                .{ .id = 6, .val = 0x1000 },
+                .{ .id = 7, .val = interp_base },
+                .{ .id = 9, .val = img.entry },
+            };
+            process.setupOpenbsd(self.runner, start_pc, img.brk, argv, envp, &aux) catch return error.ExecFailed;
+            memory.enforce = true;
+            self.new_brk = img.brk;
+            self.exec_entry = start_pc;
+            return;
+        }
+
+        // SysV/88: self-link the dynamic image, then the register handoff.
         if (img.is_dynamic) {
             dynamic.reset();
             dynamic.link(memory, self.fs, self.io, self.gpa, img.dynamic_vaddr, img.brk) catch
                 return error.ExecFailed;
         }
-
-        // New stack + entry register state.
-        self.runner.brk = img.brk;
-        self.runner.brk_base = img.brk;
-        self.runner.mmap_next = 0x0800_0000;
         process.setup(self.runner, img.entry, img.brk, argv, envp) catch return error.ExecFailed;
         memory.enforce = true;
-
         self.new_brk = img.brk;
         self.exec_entry = img.entry;
     }

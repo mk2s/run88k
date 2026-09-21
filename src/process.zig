@@ -207,7 +207,9 @@ pub fn setupOpenbsd(
     const memory = runner.memory;
 
     memory.addRegion(stack_top - stack_size, stack_size, .{ .read = true, .write = true }) catch return error.OutOfStack;
-    memory.addRegion(halt_pad, 8, .{ .read = true, .exec = true }) catch return error.OutOfStack;
+    // Pad holds the exit stub (@halt_pad) and the signal-return trampoline
+    // (@halt_pad+16); map 32 bytes r-x.
+    memory.addRegion(halt_pad, 32, .{ .read = true, .exec = true }) catch return error.OutOfStack;
 
     // Pre-map an initial heap [brk, brk+initial_heap) as RW, zero-filled.
     {
@@ -220,15 +222,22 @@ pub fn setupOpenbsd(
     runner.brk = brk + initial_heap;
     runner.brk_base = brk;
 
-    // Halt pad: OpenBSD SYS_exit stub (`or r13,r0,1; tb0 0,r0,450`) so a stray
-    // `jmp r1` out of _start terminates cleanly.
     {
         const w = memory.enforce;
         memory.enforce = false;
+        // Halt pad @halt_pad: OpenBSD SYS_exit stub (`or r13,r0,1; tb0 0,r0,450`)
+        // so a stray `jmp r1` out of _start terminates cleanly.
         memory.write32(halt_pad + 0, (@as(u32, 0x16) << 26) | (@as(u32, 13) << 21) | 1); // or r13,r0,1
         memory.write32(halt_pad + 4, 0xf000_d1c2); // tb0 0,r0,450
+        // Signal-return trampoline @halt_pad+16: `or r2,r0,r31` (scp = sp, which
+        // points at the sigcontext) then `sigreturn` (r13=103; tb0 0,r0,450).
+        // A signal handler returns here (r1 = sig_tramp).
+        memory.write32(halt_pad + 16, 0xf440_581f); // or r2, r0, r31
+        memory.write32(halt_pad + 20, (@as(u32, 0x16) << 26) | (@as(u32, 13) << 21) | 103); // or r13,r0,103
+        memory.write32(halt_pad + 24, 0xf000_d1c2); // tb0 0,r0,450
         memory.enforce = w;
     }
+    runner.sig_tramp = halt_pad + 16;
 
     const layout = try buildStackAux(memory, argv, envp, auxv);
 

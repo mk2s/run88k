@@ -317,6 +317,15 @@ pub const Fs = struct {
         return null;
     }
 
+    /// Map host fd `hfd` onto a SPECIFIC guest fd `gfd` (the dup2/dup3 target).
+    /// Assumes gfd was already closed by the caller. Returns false if gfd is out
+    /// of range.
+    pub fn allocFdAt(self: *Fs, gfd: u32, hfd: i32) bool {
+        if (gfd >= MAX_FD) return false;
+        self.host_fd[gfd] = hfd;
+        return true;
+    }
+
     pub fn get(self: *const Fs, gfd: u32) ?i32 {
         if (gfd >= MAX_FD) return null;
         const h = self.host_fd[gfd];
