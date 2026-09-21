@@ -16,7 +16,9 @@ const machine = @import("machine.zig");
 const elf = @import("loaders/elf.zig");
 const process = @import("process.zig");
 const sysv = @import("abi/sysv88.zig");
+const obsd = @import("abi/openbsd.zig");
 const dispatch = @import("syscalls/dispatch.zig");
+const dispatch_openbsd = @import("syscalls/dispatch_openbsd.zig");
 const difftrace = @import("difftrace.zig");
 const fsmod = @import("fs.zig");
 const dynamic = @import("loaders/dynamic.zig");
@@ -45,9 +47,21 @@ pub fn main(init: std.process.Init) !void {
     var mounts: [16]fsmod.Mount = undefined;
     var nmounts: usize = 0;
     var init_cwd: ?[]const u8 = null;
+    var os_choice: ?Os = null; // null => auto-detect from the ELF
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--trace")) {
             dispatch.trace = true;
+            dispatch_openbsd.trace = true;
+        } else if (std.mem.eql(u8, args[i], "--os") and i + 1 < args.len) {
+            if (std.mem.eql(u8, args[i + 1], "openbsd")) {
+                os_choice = .openbsd;
+            } else if (std.mem.eql(u8, args[i + 1], "sysv88") or std.mem.eql(u8, args[i + 1], "sysv")) {
+                os_choice = .sysv88;
+            } else {
+                outf("run88k: unknown --os '{s}' (use sysv88 or openbsd)\n", .{args[i + 1]});
+                return;
+            }
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--selftest")) {
             try selftest(gpa);
             return;
@@ -77,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
 
     const rest = args[i..];
     if (rest.len >= 2 and std.mem.eql(u8, rest[0], "run")) {
-        const code = try cmdRun(gpa, io, rest[1], rest[1..], mounts[0..nmounts], init_cwd);
+        const code = try cmdRun(gpa, io, rest[1], rest[1..], mounts[0..nmounts], init_cwd, os_choice);
         std.process.exit(@intCast(code & 0xff));
     }
 
@@ -114,9 +128,13 @@ pub fn main(init: std.process.Init) !void {
     );
 }
 
+/// Guest OS personality.
+const Os = enum { sysv88, openbsd };
+
 /// Load and run a guest ELF binary. `path` is the host path to the binary;
-/// `argv` is the guest argument vector (argv[0] = program name).
-fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []const u8, mounts: []const fsmod.Mount, init_cwd: ?[]const u8) !u32 {
+/// `argv` is the guest argument vector (argv[0] = program name). `os_choice`
+/// forces a personality; when null it is auto-detected from the ELF.
+fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []const u8, mounts: []const fsmod.Mount, init_cwd: ?[]const u8, os_choice: ?Os) !u32 {
     // Read the whole binary.
     const image = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch |e| {
         outf("run88k: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
@@ -145,10 +163,22 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     }
     defer if (fs) |*f| f.deinit();
 
+    // Select the personality: explicit --os wins, else auto-detect from the
+    // ELF (OpenBSD markers -> openbsd, otherwise SysV/88).
+    const os: Os = os_choice orelse (if (img.is_openbsd) .openbsd else .sysv88);
+
     var runner = machine.Runner.init(&memory);
     runner.attachBus(); // sets bus + cpu.reset(); mem.active = &memory
-    runner.syscall_vector = sysv.syscall_vector;
-    runner.handler = &dispatch.dispatch;
+    switch (os) {
+        .sysv88 => {
+            runner.syscall_vector = sysv.syscall_vector;
+            runner.handler = &dispatch.dispatch;
+        },
+        .openbsd => {
+            runner.syscall_vector = obsd.syscall_vector;
+            runner.handler = &dispatch_openbsd.dispatch;
+        },
+    }
     if (fs) |*f| runner.fs = f;
 
     // Process model (fork/exec/wait/pipe) — needs the fs for exec path
@@ -174,12 +204,29 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
         }
     }
 
-    // Environment: minimal for now. crt reads r4 = envp.
+    // Environment: minimal for now.
     const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
-    process.setup(&runner, img.entry, img.brk, argv, &envp) catch |e| {
-        outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
-        return 126;
-    };
+    switch (os) {
+        .sysv88 => process.setup(&runner, img.entry, img.brk, argv, &envp) catch |e| {
+            outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
+            return 126;
+        },
+        .openbsd => {
+            // OpenBSD's _start walks the ELF aux vector after envp; supply the
+            // entries libc reads (AT_PHDR/PHENT/PHNUM/PAGESZ/ENTRY).
+            const aux = [_]process.AuxEntry{
+                .{ .id = 3, .val = img.phdr_vaddr }, // AUX_phdr
+                .{ .id = 4, .val = img.phent }, // AUX_phent
+                .{ .id = 5, .val = img.phnum }, // AUX_phnum
+                .{ .id = 6, .val = 0x1000 }, // AUX_pagesz
+                .{ .id = 9, .val = img.entry }, // AUX_entry
+            };
+            process.setupOpenbsd(&runner, img.entry, img.brk, argv, &envp, &aux) catch |e| {
+                outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
+                return 126;
+            };
+        },
+    }
 
     // Enforce permissions now that loading + stack setup are done.
     memory.enforce = true;

@@ -42,19 +42,43 @@ Three things had to be in place (all in the syscall layer):
   diagnostics: no `for(int i=...)` init-decls, no mid-block declarations. Use
   old-style function defs and top-of-block declarations.
 
-## KNOWN: `cc` without `-o` faults (latent cc driver bug, NOT an emulator bug)
-`cc foo.c` / `cc -c foo.c` (no explicit `-o`) faults with a NULL deref inside
-libc `strcmp` (guest pc 0x341c8, `ld.bu r2,r3,r5` with r3=0). Root cause traced
-entirely to cc's own driver: in the per-input-file loop it does
-`strcmp(basename, <-o argument>)` to detect an output==input collision, but the
-`-o`-argument local (stack fp+0x7c) is only initialized by the `-o` option
-handler (cc code at 0x213ac/0x213ec). With no `-o` that slot stays NULL and cc
-strcmps NULL. Every syscall succeeded and the CPU faithfully executed the NULL
-deref cc coded — verified the working `-c -o util.o` run initializes the same
-slot to a valid pointer (0xbffffdd) and does not fault. Page 0 is unmapped on
-SysV/88 R4.0 too, so this would fault on real hardware unless that stack slot
-held stale non-NULL garbage. **Workaround: always pass `-o`.** (Mapping a zero
-page to paper over it was rejected — it would mask genuine null-deref bugs.)
+## KNOWN: `cc` without `-o` faults (PROBABLE latent cc driver bug, NOT an emulator bug)
+`cc foo.c` / `cc -c foo.c` / `cc -S foo.c` / `cc -V foo.c` (any invocation with
+no explicit `-o`) faults with a NULL deref inside libc `strcmp` (guest pc
+0x50341c8 = libc `strcmp` vaddr 0x341c8, `ld.bu r2,r3,r5` with r3=0). Traced
+entirely to cc's own `main()` (Ghidra-decompiled, program `cc`):
+
+- In the non-option-argument case (`case 0xffffffff:`, the input filename), cc
+  does `derived = setsuf(name, 'o')` (turn `foo.c` -> `foo.o`) then
+  `strcmp(derived, uStack_14)` to detect an output==input collision.
+- `uStack_14` is main's local at stack slot **fp+0x7c**. It is written ONLY
+  inside the `-o` option handler (`case 0x6f:`, cc code at 0x213ac and 0x213ec:
+  `st r2,r31,0x7c`). The function prologue never initializes it.
+- With no `-o` on the command line, `case 0x6f` never runs, so `uStack_14` is
+  read uninitialized. Under run88k the entire guest address space is zero-filled
+  at init (`mem.zig` `@memset(buf,0)`), so the slot reads as NULL and libc
+  `strcmp(derived, NULL)` dereferences address 0 -> fault.
+
+Every syscall on the path succeeded and the CPU faithfully executed the NULL
+deref cc coded. The working `-o` invocations (`cc -o hi hi.c`, `cc -o x -c x.c`)
+initialize the same slot to a valid pointer and never fault — confirming the
+slot is the trigger.
+
+This is a **probable cc bug** (use of an uninitialized local), masked on real
+SysV/88 hardware because the stack slot would hold stale non-NULL garbage from a
+prior frame; page 0 is unmapped there too, so a genuinely-NULL slot would fault
+on real hardware as well. Our zero-filled stack is arguably *more* deterministic
+than the hardware, which is what surfaces the latent bug.
+
+Per decision: **noted as a probable cc bug; no emulator action taken.**
+**Workaround: always pass `-o`.** (Mapping/seeding memory to paper over it was
+rejected — it would mask genuine null-deref bugs.)
+
+Note on tooling: nothing was wrong with Ghidra's ELF loader here — it loaded
+`cc` correctly (image_base 0x20034, proper .text, 259 funcs, retained .symtab)
+once a stale raw-binary import of the same name was removed. When multiple
+programs are open, pass `program=<name>` explicitly on every Ghidra MCP call;
+the default active program is not reliably the one just switched to.
 
 ## Requirements to run the toolchain
 - Mounts: `--root <hd0_root> --mount /usr=<hd0_slice3>` as usual, PLUS a

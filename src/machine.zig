@@ -92,6 +92,9 @@ pub const Runner = struct {
     file_maps: [16]FileMap = @splat(.{}),
     /// umask (tracked; applied host-side).
     umask: u32 = 0,
+    /// Thread control block pointer (OpenBSD __set_tcb/__get_tcb). Holds the
+    /// TLS/stack-guard base the guest libc installs at startup.
+    tcb: u32 = 0,
     /// Set by a successful execve: the run loop must NOT advance PC past the
     /// trap (the handler already set PC to the new image's entry). Cleared by
     /// the run loop after honoring it.

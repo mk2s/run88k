@@ -31,7 +31,22 @@ pub const LoadedImage = struct {
     /// True if the executable requests an interpreter (PT_INTERP present) or
     /// has a PT_DYNAMIC — i.e. it needs dynamic linking.
     is_dynamic: bool = false,
+    /// True if the object carries OpenBSD markers (a PT_OPENBSD_* program
+    /// header such as OPENBSD_RANDOM/WXNEEDED/BOOTDATA). Used to auto-select
+    /// the OpenBSD personality when the CLI didn't force one.
+    is_openbsd: bool = false,
+    /// Guest vaddr of the program header table (for the ELF aux vector's
+    /// AT_PHDR). 0 if the phdrs are not covered by a PT_LOAD segment.
+    phdr_vaddr: u32 = 0,
+    phent: u16 = 0, // size of one program header (AT_PHENT)
+    phnum: u16 = 0, // number of program headers (AT_PHNUM)
 };
+
+/// OpenBSD-specific program header types (all in the OS-specific range).
+pub const PT_OPENBSD_RANDOMIZE = 0x65a3dbe6;
+pub const PT_OPENBSD_WXNEEDED = 0x65a3dbe7;
+pub const PT_OPENBSD_BOOTDATA = 0x65a41be6;
+pub const PT_OPENBSD_NOBTCFI = 0x65a3dbe8;
 
 /// A mapped ELF object (executable or shared library), with the metadata the
 /// dynamic linker needs. Segments are already loaded into guest memory.
@@ -193,8 +208,10 @@ pub fn load(memory: *mem.Memory, image: []const u8) Error!LoadedImage {
     // relocations when is_dynamic is set.
     const obj = try mapSegments(memory, image, 0);
 
-    // Detect dynamic linking: presence of PT_INTERP or PT_DYNAMIC.
+    // Detect dynamic linking (PT_INTERP or PT_DYNAMIC) and OpenBSD markers
+    // (any PT_OPENBSD_* program header) in one pass over the phdrs.
     var is_dyn = obj.dynamic_vaddr != 0;
+    var is_obsd = false;
     const e_phoff = rd32(image, 28);
     const e_phentsize = rd16(image, 42);
     const e_phnum = rd16(image, 44);
@@ -202,7 +219,29 @@ pub fn load(memory: *mem.Memory, image: []const u8) Error!LoadedImage {
     while (i < e_phnum) : (i += 1) {
         const ph = e_phoff + i * e_phentsize;
         if (ph + 4 > image.len) break;
-        if (rd32(image, ph + 0) == PT_INTERP) is_dyn = true;
+        const pt = rd32(image, ph + 0);
+        if (pt == PT_INTERP) is_dyn = true;
+        if (pt == PT_OPENBSD_RANDOMIZE or pt == PT_OPENBSD_WXNEEDED or
+            pt == PT_OPENBSD_BOOTDATA or pt == PT_OPENBSD_NOBTCFI) is_obsd = true;
+    }
+
+    // Locate the program header table in guest memory (AT_PHDR): find the
+    // PT_LOAD whose file range covers e_phoff, then map the offset through.
+    var phdr_vaddr: u32 = 0;
+    {
+        var j: usize = 0;
+        while (j < e_phnum) : (j += 1) {
+            const ph = e_phoff + j * e_phentsize;
+            if (ph + 32 > image.len) break;
+            if (rd32(image, ph + 0) != PT_LOAD) continue;
+            const p_offset = rd32(image, ph + 4);
+            const p_vaddr = rd32(image, ph + 8);
+            const p_filesz = rd32(image, ph + 16);
+            if (e_phoff >= p_offset and e_phoff + @as(u32, e_phnum) * e_phentsize <= p_offset + p_filesz) {
+                phdr_vaddr = p_vaddr + (e_phoff - p_offset);
+                break;
+            }
+        }
     }
 
     // The initial program break is the EXACT end of the highest loaded segment,
@@ -214,6 +253,10 @@ pub fn load(memory: *mem.Memory, image: []const u8) Error!LoadedImage {
         .load_high = obj.load_high,
         .dynamic_vaddr = obj.dynamic_vaddr,
         .is_dynamic = is_dyn,
+        .is_openbsd = is_obsd,
+        .phdr_vaddr = phdr_vaddr,
+        .phent = e_phentsize,
+        .phnum = e_phnum,
     };
 }
 

@@ -35,12 +35,28 @@ pub const Layout = struct {
     envp_ptr: u32, // guest address of envp[0] slot
 };
 
+/// One ELF auxiliary-vector entry ({ id, val }, 8 bytes). OpenBSD's `_start`/
+/// libc walks the auxv (after the envp NULL) for AT_PHDR/PAGESZ/ENTRY/etc.,
+/// terminated by an AUX_null entry — omitting it makes libc read off the end
+/// of the stack.
+pub const AuxEntry = struct { id: u32, val: u32 };
+
 /// Build the argv/envp image on the stack and return the layout. Enforcement
-/// is toggled off while scribbling and restored.
+/// is toggled off while scribbling and restored. `auxv` (may be empty) is
+/// appended after the envp NULL; an AUX_null terminator is always added.
 pub fn buildStack(
     memory: *mem.Memory,
     argv: []const []const u8,
     envp: []const []const u8,
+) StartError!Layout {
+    return buildStackAux(memory, argv, envp, &.{});
+}
+
+pub fn buildStackAux(
+    memory: *mem.Memory,
+    argv: []const []const u8,
+    envp: []const []const u8,
+    auxv: []const AuxEntry,
 ) StartError!Layout {
     const was = memory.enforce;
     memory.enforce = false;
@@ -77,10 +93,13 @@ pub fn buildStack(
     }
 
     // Pointer table below the strings (high to low): argc, argv[]+NULL,
-    // envp[]+NULL, all 4-byte words. Lay it out from a longword-aligned sp.
+    // envp[]+NULL, auxv[]+{AUX_null,0}, all 4-byte words. Lay it out from a
+    // longword-aligned sp.
     const n_argv: u32 = @intCast(argv.len);
     const n_envp: u32 = @intCast(envp.len);
-    const total_words: u32 = 1 + (n_argv + 1) + (n_envp + 1);
+    const n_aux: u32 = @intCast(auxv.len);
+    // aux entries are 2 words each, plus the {0,0} AUX_null terminator (2 words).
+    const total_words: u32 = 1 + (n_argv + 1) + (n_envp + 1) + (n_aux * 2 + 2);
     const table_bytes = total_words * 4;
 
     var sp = string_area - table_bytes;
@@ -104,6 +123,15 @@ pub fn buildStack(
         w += 4;
     }
     memory.write32(w, 0); // envp NULL
+    w += 4;
+    // ELF auxiliary vector, terminated by AUX_null {0,0}.
+    for (auxv) |a| {
+        memory.write32(w, a.id);
+        memory.write32(w + 4, a.val);
+        w += 8;
+    }
+    memory.write32(w, 0); // AUX_null id
+    memory.write32(w + 4, 0); // AUX_null val
 
     return .{ .sp = sp, .argc = n_argv, .argv_ptr = argv_ptr, .envp_ptr = envp_ptr };
 }
@@ -159,6 +187,53 @@ pub fn setup(
     runner.setReg(4, layout.envp_ptr); // r4 = envp
     runner.setReg(6, 0); // r6 = cleanup fn (none)
     runner.setReg(machine.Reg.sp, layout.sp); // r31 = SP
+    runner.setReg(machine.Reg.link, halt_pad); // r1 = return address -> halt pad
+    runner.setPc(entry);
+}
+
+/// OpenBSD/luna88k process setup. Unlike SysV/88, OpenBSD's `_start` reads
+/// argc/argv/envp off the STACK itself (r2=mem[sp], r3=sp+4, envp derived) and
+/// does NOT rely on a register handoff. So we build the same stack image via
+/// buildStack() but leave r2..r6 alone; only r31 (SP) and PC matter. The halt
+/// pad uses the OpenBSD exit stub (vector 450, number in r13).
+pub fn setupOpenbsd(
+    runner: *machine.Runner,
+    entry: u32,
+    brk: u32,
+    argv: []const []const u8,
+    envp: []const []const u8,
+    auxv: []const AuxEntry,
+) StartError!void {
+    const memory = runner.memory;
+
+    memory.addRegion(stack_top - stack_size, stack_size, .{ .read = true, .write = true }) catch return error.OutOfStack;
+    memory.addRegion(halt_pad, 8, .{ .read = true, .exec = true }) catch return error.OutOfStack;
+
+    // Pre-map an initial heap [brk, brk+initial_heap) as RW, zero-filled.
+    {
+        const w = memory.enforce;
+        memory.enforce = false;
+        memory.zero(brk, initial_heap);
+        memory.enforce = w;
+    }
+    memory.addRegion(brk, initial_heap, .{ .read = true, .write = true }) catch return error.OutOfStack;
+    runner.brk = brk + initial_heap;
+    runner.brk_base = brk;
+
+    // Halt pad: OpenBSD SYS_exit stub (`or r13,r0,1; tb0 0,r0,450`) so a stray
+    // `jmp r1` out of _start terminates cleanly.
+    {
+        const w = memory.enforce;
+        memory.enforce = false;
+        memory.write32(halt_pad + 0, (@as(u32, 0x16) << 26) | (@as(u32, 13) << 21) | 1); // or r13,r0,1
+        memory.write32(halt_pad + 4, 0xf000_d1c2); // tb0 0,r0,450
+        memory.enforce = w;
+    }
+
+    const layout = try buildStackAux(memory, argv, envp, auxv);
+
+    // No register handoff: _start reads argc/argv/envp from the stack.
+    runner.setReg(machine.Reg.sp, layout.sp); // r31 = SP (points at argc)
     runner.setReg(machine.Reg.link, halt_pad); // r1 = return address -> halt pad
     runner.setPc(entry);
 }

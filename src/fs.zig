@@ -502,3 +502,76 @@ test "allocFdFrom honors a floor (F_DUPFD contract)" {
     _ = fs.closeFd(1);
     try std.testing.expectEqual(@as(u32, 1), fs.allocFdFrom(90, 1).?);
 }
+
+// ---------------------------------------------------------------------------
+// getcwd / mount-boundary regression guards.
+//
+// A userland getcwd() (SVR4 has no getcwd syscall) walks up via
+// getdents("..") + lstat, matching (dev,ino). A virtual mount overlay (e.g.
+// /work on a different host fs than guest /) has no real entry in its parent's
+// on-disk listing, so the walk fails ("getcwd (bu5)" in make). The fix makes
+// getdents synthesize a child entry for each mount point whose parent is the
+// directory being listed; mountChild() is the enumeration that drives it.
+// These guard the pure logic; the getdents synthesis itself is exercised
+// end-to-end by running make against a mounted tree.
+
+test "mountChild enumerates mounts directly under a directory" {
+    var fs = try Fs.init(std.testing.allocator);
+    defer fs.deinit();
+    try fs.addMount("/", "/mnt/hd0_root");
+    try fs.addMount("/usr", "/mnt/hd0_slice3");
+    try fs.addMount("/work", "/tmp/asm88");
+    try fs.addMount("/var/tmp", "/tmp/guest_vartmp");
+
+    // Children of "/": usr and work (root itself is never a child; /var/tmp is
+    // nested under /var, not /).
+    const c0 = fs.mountChild("/", 0).?;
+    try std.testing.expectEqualStrings("usr", c0.name);
+    try std.testing.expectEqualStrings("/mnt/hd0_slice3", c0.host_root);
+    const c1 = fs.mountChild("/", 1).?;
+    try std.testing.expectEqualStrings("work", c1.name);
+    try std.testing.expectEqualStrings("/tmp/asm88", c1.host_root);
+    // Only two children of "/": index 2 is past the end.
+    try std.testing.expect(fs.mountChild("/", 2) == null);
+
+    // Nested mount: /var/tmp appears as child "tmp" of "/var", NOT of "/".
+    const v = fs.mountChild("/var", 0).?;
+    try std.testing.expectEqualStrings("tmp", v.name);
+    try std.testing.expectEqualStrings("/tmp/guest_vartmp", v.host_root);
+    try std.testing.expect(fs.mountChild("/var", 1) == null);
+
+    // A directory with no mount children yields nothing.
+    try std.testing.expect(fs.mountChild("/usr", 0) == null);
+    try std.testing.expect(fs.mountChild("/nonexistent", 0) == null);
+}
+
+test "canonicalGuest collapses . and .. for dir-entry synthesis" {
+    var fs = try testFs();
+    defer fs.deinit();
+    var out: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/work", fs.canonicalGuest("/work", &out).?);
+    try std.testing.expectEqualStrings("/work", fs.canonicalGuest("/usr/../work", &out).?);
+    try std.testing.expectEqualStrings("/", fs.canonicalGuest("/", &out).?);
+    // Relative resolves against cwd.
+    try fs.chdir("/usr/lib");
+    try std.testing.expectEqualStrings("/usr/lib", fs.canonicalGuest(".", &out).?);
+    try std.testing.expectEqualStrings("/usr", fs.canonicalGuest("..", &out).?);
+}
+
+test "dir synth cursor advances and rewinds per fd" {
+    var fs = try testFs();
+    defer fs.deinit();
+    // The cursor lets getdents resume synthetic-entry emission across calls /
+    // buffer boundaries. Exercise the accessor contract directly.
+    const gfd: u32 = 7;
+    try std.testing.expectEqual(@as(usize, 0), fs.dirSynthNext(gfd));
+    fs.dirSynthAdvance(gfd);
+    fs.dirSynthAdvance(gfd);
+    try std.testing.expectEqual(@as(usize, 2), fs.dirSynthNext(gfd));
+    fs.dirSynthRewind(gfd);
+    try std.testing.expectEqual(@as(usize, 1), fs.dirSynthNext(gfd));
+    // Rewind never underflows below 0.
+    fs.dirSynthRewind(gfd);
+    fs.dirSynthRewind(gfd);
+    try std.testing.expectEqual(@as(usize, 0), fs.dirSynthNext(gfd));
+}
