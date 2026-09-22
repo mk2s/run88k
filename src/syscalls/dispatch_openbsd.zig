@@ -273,6 +273,7 @@ pub fn dispatch(runner: *machine.Runner) bool {
             return true;
         },
         .__getcwd => return sysGetcwd(runner),
+        .__realpath => return sysRealpath(runner),
         .chdir => return sysChdir(runner),
         .fchdir => return sysFchdir(runner),
         .fork, .vfork => return sysFork(runner),
@@ -282,6 +283,40 @@ pub fn dispatch(runner: *machine.Runner) bool {
         .dup => return sysDup(runner),
         .dup2, .dup3 => return sysDup2(runner),
         .access => return sysAccess(runner),
+        .unlink => return sysUnlink(runner),
+        .rename => return sysRename(runner),
+        .mkdir => return sysMkdir(runner),
+        .rmdir => return sysRmdir(runner),
+        .link => return sysLink(runner),
+        .ftruncate => return sysFtruncate(runner),
+        .chmod => return sysChmod(runner),
+        .fchmod => return sysFchmod(runner),
+        .umask => {
+            const old = runner.umask;
+            runner.umask = obsd.arg(cpu, 0) & 0o777;
+            obsd.returnSuccess(cpu, old);
+            return true;
+        },
+        .getrlimit => {
+            // Report a generous limit: rlim_cur = rlim_max = large. struct
+            // rlimit { rlim_t cur; rlim_t max; } with rlim_t = 64-bit.
+            const rlp = obsd.arg(cpu, 1);
+            if (rlp != 0 and @as(u64, rlp) + 16 <= mem.Memory.size) {
+                const was = runner.memory.enforce;
+                runner.memory.enforce = false;
+                runner.memory.write32(rlp + 0, 0x7fffffff); // cur hi/lo (just large)
+                runner.memory.write32(rlp + 4, 0xffffffff);
+                runner.memory.write32(rlp + 8, 0x7fffffff); // max
+                runner.memory.write32(rlp + 12, 0xffffffff);
+                runner.memory.enforce = was;
+            }
+            obsd.returnSuccess(cpu, 0);
+            return true;
+        },
+        .setrlimit => {
+            obsd.returnSuccess(cpu, 0);
+            return true;
+        },
         .fcntl => return sysFcntl(runner),
         .mmap => return sysMmap(runner),
         // munmap/mprotect/madvise/minherit/msync: we don't reclaim ranges (the
@@ -468,10 +503,13 @@ fn sysClose(runner: *machine.Runner) bool {
 fn sysLseek(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const gfd = obsd.arg(cpu, 0);
-    // lseek(fd, pad, off_lo, off_hi, whence): off_t in the r4:r5 pair (arg1 is
-    // the alignment pad r3), whence in arg4 (r6). off_hi = arg3, off_lo = arg2.
-    const off_lo: u64 = obsd.arg(cpu, 2);
-    const off_hi: u64 = obsd.arg(cpu, 3);
+    // lseek(fd, pad, off_hi, off_lo, whence): off_t in the r4:r5 pair (arg1 is
+    // the alignment pad r3), whence in arg4 (r6). Big-endian m88k stores a
+    // 64-bit value high-word-first, so the even (lower-numbered) register r4
+    // holds the HIGH word: off_hi = arg2, off_lo = arg3. (Confirmed by trace:
+    // `as` seeking to 0x2b4 put 0x2b4 in arg3 and 0 in arg2.)
+    const off_hi: u64 = obsd.arg(cpu, 2);
+    const off_lo: u64 = obsd.arg(cpu, 3);
     const off: i64 = @bitCast((off_hi << 32) | off_lo);
     const whence = obsd.arg(cpu, 4);
     const hfd = hostFd(runner, gfd) orelse {
@@ -661,6 +699,201 @@ fn sysAccess(runner: *machine.Runner) bool {
     return true;
 }
 
+/// Read a guest path arg (index n) and resolve it to a host path via the fs.
+/// Returns null (and sets ENOENT/EINVAL) on failure.
+fn resolveArg(runner: *machine.Runner, n: u5, gbuf: []u8, hbuf: []u8) ?[*:0]const u8 {
+    const cpu = &runner.cpu;
+    const gpath = readGuestPath(runner, obsd.arg(cpu, n), gbuf) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return null;
+    };
+    if (fsOf(runner)) |fs| {
+        const hp = fs.resolve(gpath, hbuf) catch {
+            obsd.returnError(cpu, ENOENT);
+            return null;
+        };
+        return hp.ptr;
+    }
+    return @ptrCast(gbuf[0 .. gpath.len + 1].ptr);
+}
+
+fn sysUnlink(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    var gb: [1024]u8 = undefined;
+    var hb: [2048]u8 = undefined;
+    const cp = resolveArg(runner, 0, &gb, &hb) orelse return true;
+    if (fsmod.c.unlink(cp) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysRmdir(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    var gb: [1024]u8 = undefined;
+    var hb: [2048]u8 = undefined;
+    const cp = resolveArg(runner, 0, &gb, &hb) orelse return true;
+    if (fsmod.c.rmdir(cp) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysMkdir(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    var gb: [1024]u8 = undefined;
+    var hb: [2048]u8 = undefined;
+    const cp = resolveArg(runner, 0, &gb, &hb) orelse return true;
+    const mode = obsd.arg(cpu, 1);
+    if (fsmod.c.mkdir(cp, mode) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// rename(old, new): both paths resolved through the mount table.
+fn sysRename(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const fs = fsOf(runner) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    var gb0: [1024]u8 = undefined;
+    var gb1: [1024]u8 = undefined;
+    const g0 = readGuestPath(runner, obsd.arg(cpu, 0), &gb0) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    const g1 = readGuestPath(runner, obsd.arg(cpu, 1), &gb1) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    var hb0: [2048]u8 = undefined;
+    var hb1: [2048]u8 = undefined;
+    const h0 = fs.resolve(g0, &hb0) catch {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    };
+    const h1 = fs.resolve(g1, &hb1) catch {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    };
+    if (fsmod.c.rename(h0, h1) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysLink(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const fs = fsOf(runner) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    var gb0: [1024]u8 = undefined;
+    var gb1: [1024]u8 = undefined;
+    const g0 = readGuestPath(runner, obsd.arg(cpu, 0), &gb0) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    const g1 = readGuestPath(runner, obsd.arg(cpu, 1), &gb1) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    var hb0: [2048]u8 = undefined;
+    var hb1: [2048]u8 = undefined;
+    const h0 = fs.resolve(g0, &hb0) catch {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    };
+    const h1 = fs.resolve(g1, &hb1) catch {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    };
+    if (fsmod.c.link(h0, h1) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// ftruncate(fd, length): 64-bit off_t `length` in the even/odd r4:r5 pair.
+/// fd is r2 (arg0); r3 is the alignment pad; off_hi = arg2 (r4), off_lo = arg3
+/// (r5). The earlier bug read only arg2 as the low word, so a small file
+/// truncated to (hi<<0) garbage -> multi-terabyte .o sizes.
+fn sysFtruncate(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gfd = obsd.arg(cpu, 0);
+    const len_hi: u64 = obsd.arg(cpu, 2);
+    const len_lo: u64 = obsd.arg(cpu, 3);
+    const len: i64 = @bitCast((len_hi << 32) | len_lo);
+    const hfd = hostFd(runner, gfd) orelse {
+        obsd.returnError(cpu, EBADF);
+        return true;
+    };
+    if (fsmod.c.ftruncate(hfd, @intCast(len)) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// chmod(path, mode): set file permission bits. mode's low 12 bits (the
+/// permission + setuid/gid/sticky bits) map 1:1 between OpenBSD and the host.
+fn sysChmod(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    var gb: [1024]u8 = undefined;
+    var hb: [2048]u8 = undefined;
+    const cp = resolveArg(runner, 0, &gb, &hb) orelse return true;
+    const mode = obsd.arg(cpu, 1) & 0o7777;
+    if (fsmod.c.chmod(cp, mode) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// fchmod(fd, mode): as chmod but on an open descriptor.
+fn sysFchmod(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const gfd = obsd.arg(cpu, 0);
+    const mode = obsd.arg(cpu, 1) & 0o7777;
+    const hfd = hostFd(runner, gfd) orelse {
+        obsd.returnError(cpu, EBADF);
+        return true;
+    };
+    if (fsmod.c.fchmod(hfd, mode) < 0) obsd.returnError(cpu, mapErrno(hostErrno())) else obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// __realpath(path, resolved): canonicalize `path` (collapse ./.. and follow
+/// symlinks) into the guest buffer `resolved` (PATH_MAX). We produce the
+/// guest-absolute canonical path via the fs (which knows the mount table and
+/// symlinks); good enough for cc/make locating their tools. Returns 0 on
+/// success (the guest libc wrapper turns that into the buffer pointer).
+fn sysRealpath(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const path_ptr = obsd.arg(cpu, 0);
+    const resolved = obsd.arg(cpu, 1);
+    var gbuf: [1024]u8 = undefined;
+    const gpath = readGuestPath(runner, path_ptr, &gbuf) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    const fs = fsOf(runner) orelse {
+        obsd.returnError(cpu, EINVAL);
+        return true;
+    };
+    // Canonicalize to a guest-absolute path. If it doesn't resolve, ENOENT.
+    var cbuf: [1024]u8 = undefined;
+    const canon = fs.canonicalGuest(gpath, &cbuf) orelse {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    };
+    // Verify existence via the host (resolve through the mount table).
+    var hbuf: [2048]u8 = undefined;
+    const hp = fs.resolve(gpath, &hbuf) catch {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    };
+    if (fsmod.c.access(hp, 0) < 0) {
+        obsd.returnError(cpu, ENOENT);
+        return true;
+    }
+    if (resolved != 0 and @as(u64, resolved) + canon.len + 1 <= mem.Memory.size) {
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        runner.memory.writeBytes(resolved, canon);
+        runner.memory.write8(resolved + @as(u32, @intCast(canon.len)), 0);
+        runner.memory.enforce = was;
+    }
+    obsd.returnSuccess(cpu, 0);
+    return true;
+}
+
 fn sysChdir(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const path_ptr = obsd.arg(cpu, 0);
@@ -847,10 +1080,11 @@ fn writeGuestStat(runner: *machine.Runner, statbuf: u32, hs: *const HostStat) vo
     m.write32(statbuf + 52, @bitCast(@as(i32, @truncate(hs.mtime)))); // st_mtim.sec lo
     m.write32(statbuf + 64, 0); // st_ctim.sec hi
     m.write32(statbuf + 68, @bitCast(@as(i32, @truncate(hs.ctime)))); // st_ctim.sec lo
-    m.write32(statbuf + 80, 0); // st_size hi
+    m.write32(statbuf + 80, @truncate(hs.size >> 32)); // st_size hi
     m.write32(statbuf + 84, @truncate(hs.size)); // st_size lo
-    m.write32(statbuf + 88, 0); // st_blocks hi
-    m.write32(statbuf + 92, @intCast((hs.size + 511) / 512)); // st_blocks lo
+    const blocks: u64 = (hs.size + 511) / 512;
+    m.write32(statbuf + 88, @truncate(blocks >> 32)); // st_blocks hi
+    m.write32(statbuf + 92, @truncate(blocks)); // st_blocks lo
     m.write32(statbuf + 96, 0x1000); // st_blksize
     runner.memory.enforce = was;
 }
@@ -1215,7 +1449,6 @@ fn deliverSigchld(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const handler = runner.sig_handlers[SIGCHLD];
     if (handler == 0) return false;
-
     // Push our sigcontext below the current SP (16-byte aligned).
     var sp = cpu.getReg(31);
     sp -%= SC_WORDS * 4;

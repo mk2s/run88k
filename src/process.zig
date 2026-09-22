@@ -181,6 +181,16 @@ pub fn setup(
 
     const layout = try buildStack(memory, argv, envp);
 
+    // Clean register file (a real exec hands off zeroed GPRs; on exec from a
+    // forked child the CPU still holds the caller's values).
+    var ri: u5 = 0;
+    while (true) {
+        runner.setReg(ri, 0);
+        if (ri == 31) break;
+        ri += 1;
+    }
+    runner.cpu.branch_pending = false;
+
     // Register handoff (docs/abi-sysv88.md).
     runner.setReg(2, layout.argc); // r2 = argc
     runner.setReg(3, layout.argv_ptr); // r3 = argv
@@ -240,6 +250,22 @@ pub fn setupOpenbsd(
     runner.sig_tramp = halt_pad + 16;
 
     const layout = try buildStackAux(memory, argv, envp, auxv);
+
+    // A real exec(2) hands the new program a CLEAN register file. On the
+    // initial launch cpu.reset() already zeroed the GPRs, but on exec (this is
+    // reached from a forked child servicing execve) the CPU still holds the
+    // caller's register values. Zero them so the new image never reads a stale
+    // parent register — OpenBSD's _start reads several GPRs before initializing
+    // them, and a leftover parent pointer (e.g. make's) makes a static echo
+    // fault. (SysV/88 relies on the register handoff below and is similarly
+    // cleared by its own setup path.)
+    var ri: u5 = 0;
+    while (true) {
+        runner.setReg(ri, 0);
+        if (ri == 31) break;
+        ri += 1;
+    }
+    runner.cpu.branch_pending = false;
 
     // No register handoff: _start reads argc/argv/envp from the stack.
     runner.setReg(machine.Reg.sp, layout.sp); // r31 = SP (points at argc)

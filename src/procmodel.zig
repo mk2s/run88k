@@ -56,9 +56,34 @@ pub const HostProcess = struct {
     /// True when running an OpenBSD guest: exec must map ld.so + build the ELF
     /// aux vector + use the stack-based startup instead of the SysV path.
     openbsd: bool = false,
+    /// A small ring of already-reaped children awaiting a guest wait4.
+    ///
+    /// SIGCHLD delivery peeks for a reapable child before jumping to the
+    /// handler, and the handler then calls wait4 to reap it. Relying on
+    /// WNOWAIT to "peek without reaping" proved fragile (a following
+    /// waitpid(0) could return ECHILD), so instead the peek REAPS the child
+    /// immediately and stashes its (pid,status) here; the guest's subsequent
+    /// wait4 drains this cache first. This guarantees the handler's wait4 sees
+    /// exactly the child that triggered the signal.
+    reaped: [16]WaitResult = undefined,
+    n_reaped: usize = 0,
 
     pub fn init(runner: *machine.Runner, fs: *fsmod.Fs, io: std.Io, gpa: std.mem.Allocator) HostProcess {
         return .{ .runner = runner, .fs = fs, .io = io, .gpa = gpa };
+    }
+
+    fn pushReaped(self: *HostProcess, r: WaitResult) void {
+        if (self.n_reaped >= self.reaped.len) return; // drop (unbounded fork storm guard)
+        self.reaped[self.n_reaped] = r;
+        self.n_reaped += 1;
+    }
+    fn popReaped(self: *HostProcess) ?WaitResult {
+        if (self.n_reaped == 0) return null;
+        const r = self.reaped[0];
+        var i: usize = 1;
+        while (i < self.n_reaped) : (i += 1) self.reaped[i - 1] = self.reaped[i];
+        self.n_reaped -= 1;
+        return r;
     }
 
     /// fork: host fork(). Returns the host rc: >0 child pid (parent), 0 (child).
@@ -77,15 +102,22 @@ pub const HostProcess = struct {
         return self.doWaitOpts(false);
     }
     pub fn doWaitOpts(self: *HostProcess, nohang: bool) ProcError!WaitResult {
-        _ = self;
         if (!is_posix) return error.NotSupported;
+        // Drain a previously-reaped child first (stashed by the SIGCHLD peek).
+        if (self.popReaped()) |r| return r;
         var status: c_int = 0;
         const WNOHANG: c_int = 1;
         const pid = libc.waitpid(-1, &status, if (nohang) WNOHANG else 0);
         if (pid < 0) return error.NoChild;
         if (pid == 0) return .{ .pid = 0, .status = 0 }; // WNOHANG: none ready
-        const exit_code: u32 = (@as(u32, @bitCast(status)) >> 8) & 0xff;
-        return .{ .pid = @intCast(pid), .status = (exit_code & 0xff) << 8 };
+        return decodeWait(@intCast(pid), status);
+    }
+
+    fn decodeWait(pid: u32, status: c_int) WaitResult {
+        const s: u32 = @bitCast(status);
+        // Normal exit: low 7 bits 0, exit code in bits 8..15. Signal death:
+        // low 7 bits = signal. Preserve both so the guest's W* macros work.
+        return .{ .pid = pid, .status = s & 0xffff };
     }
 
     /// Peek whether any child has exited and is reapable, WITHOUT reaping it
@@ -94,20 +126,22 @@ pub const HostProcess = struct {
     /// ready. On platforms without WNOWAIT support this still works because we
     /// only use it as a hint.
     pub fn childReapable(self: *HostProcess) bool {
-        _ = self;
         if (!is_posix) return false;
+        if (self.n_reaped > 0) return true;
         var status: c_int = 0;
         const WNOHANG: c_int = 1;
-        const WNOWAIT: c_int = 8; // don't reap; leave the child waitable
-        const pid = libc.waitpid(-1, &status, WNOHANG | WNOWAIT);
-        return pid > 0;
+        const pid = libc.waitpid(-1, &status, WNOHANG);
+        if (pid <= 0) return false;
+        // Reap-and-cache: the guest's wait4 will drain this.
+        self.pushReaped(decodeWait(@intCast(pid), status));
+        return true;
     }
 
     /// Whether the process currently has any children (running or reapable).
     /// A WNOHANG peek returning ECHILD (-1) means none; 0 or >0 means some.
     pub fn hasChildren(self: *HostProcess) bool {
-        _ = self;
         if (!is_posix) return false;
+        if (self.n_reaped > 0) return true;
         var status: c_int = 0;
         const WNOHANG: c_int = 1;
         const WNOWAIT: c_int = 8;
@@ -115,16 +149,16 @@ pub const HostProcess = struct {
         return pid >= 0; // >=0 means a child exists (0 running, >0 reapable)
     }
 
-    /// Block until a child is reapable, WITHOUT reaping it (so the guest's
-    /// SIGCHLD handler can wait4 it). Returns true if a child became ready,
-    /// false if there are no children. Used by sigsuspend to avoid spinning.
+    /// Block until a child exits, REAP it, and cache the result (the guest's
+    /// SIGCHLD handler will wait4 to drain it). Returns true if a child was
+    /// reaped, false if there are none. Used by sigsuspend to avoid spinning.
     pub fn blockUntilChild(self: *HostProcess) bool {
-        _ = self;
         if (!is_posix) return false;
         var status: c_int = 0;
-        const WNOWAIT: c_int = 8; // leave the child waitable for the guest
-        const pid = libc.waitpid(-1, &status, WNOWAIT);
-        return pid > 0;
+        const pid = libc.waitpid(-1, &status, 0); // block, reap
+        if (pid <= 0) return false;
+        self.pushReaped(decodeWait(@intCast(pid), status));
+        return true;
     }
 
     /// pipe: host pipe(), both ends registered in the guest fd table.

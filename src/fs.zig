@@ -27,6 +27,10 @@ pub const c = struct {
     pub extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
     pub extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
     pub extern "c" fn rmdir(path: [*:0]const u8) c_int;
+    pub extern "c" fn link(oldp: [*:0]const u8, newp: [*:0]const u8) c_int;
+    pub extern "c" fn ftruncate(fd: c_int, len: c_long) c_int;
+    pub extern "c" fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+    pub extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
 };
 
 // Directory-stream shim (src/host_dir.c).
@@ -342,7 +346,13 @@ pub const Fs = struct {
             self.dir_path_len[gfd] = 0;
             self.dir_synth_next[gfd] = 0;
         }
-        if (gfd > 2) _ = c.close(h);
+        // Close the underlying HOST fd whenever it is one we allocated (>= 3).
+        // Guard on the *host* fd, not the guest fd: a guest may dup2 a pipe end
+        // onto guest fd 0/1/2 and then replace it — if we skipped the close for
+        // guest 0/1/2 the pipe end (host fd >= 3) would leak, and a downstream
+        // reader would never see EOF (the `echo x | wc -w` hang). Host fds 0/1/2
+        // are the emulator's own stdio and must never be closed here.
+        if (h > 2) _ = c.close(h);
         self.host_fd[gfd] = -1;
         return true;
     }
