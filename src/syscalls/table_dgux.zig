@@ -105,6 +105,7 @@ pub const Ext = enum(u32) {
     vfork = 74, // libc stub `_abi_vfork`
     dg_bind = 88,
     dg_connect = 89,
+    dg_gethostname = 91, // used by hostname(1); no standalone libc stub
     dg_getsockname = 93,
     dg_recvfrom = 97,
     dg_select = 99,

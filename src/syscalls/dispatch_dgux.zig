@@ -96,6 +96,7 @@ const EFAULT: u32 = 14;
 const EINVAL: u32 = 22;
 const ENOTTY: u32 = 25;
 const ENOSYS: u32 = 89; // SVR4: function not implemented
+const EAFNOSUPPORT: u32 = 97; // address family not supported (sockets stubbed)
 
 /// Map a host (Linux) errno to a DG/UX errno. DG/UX's low numbers are the SVR4
 /// set, which coincides with Linux for the common 1..34 range; anything
@@ -225,6 +226,10 @@ fn dispatchStd(runner: *machine.Runner) bool {
         .bcs_time => return sysTime(runner),
         .times => return sysTimes(runner),
         .getcwd => return sysGetcwd(runner),
+        .sync => {
+            dgux.returnSuccess(cpu, 0); // no-op: host fs is coherent
+            return true;
+        },
         .fstat => return sysFstat(runner),
         .stat => return sysStat(runner),
         .access => return sysAccess(runner),
@@ -321,6 +326,17 @@ fn dispatchExt(runner: *machine.Runner) bool {
             return true;
         },
         .uname => return sysUname(runner),
+        .dg_gethostname => return sysGethostname(runner),
+        .dg_getdomainname => return sysGetdomainname(runner),
+        .dg_process_info => return sysProcessInfo(runner),
+
+        // Networking (sockets): not emulated. Return an error so callers fall
+        // back to local files (e.g. id/logname query a name service via a
+        // socket, then fall back to /etc/passwd on failure).
+        .dg_socket, .dg_bind, .dg_connect, .dg_getsockname, .dg_recvfrom, .dg_sendto => {
+            dgux.returnError(cpu, EAFNOSUPPORT);
+            return true;
+        },
 
         // Signal syscalls: accept, return benign success.
         .dg_sigaction, .dg_sigblock, .dg_sigsetmask, .sighold, .sigrelse, .sigignore => {
@@ -943,10 +959,9 @@ fn sysAccess(runner: *machine.Runner) bool {
 
 // -- uname -------------------------------------------------------------------
 
-// SVR4 `struct utsname`: five (or six) SYS_NMLN-byte fields. DG/UX SYS_NMLN is
-// 257 on later releases; refine when a uname-using guest runs. Fields:
-// sysname, nodename, release, version, machine.
-const UTS_NMLN: u32 = 257;
+// DG/UX `struct utsname`: five 256-byte fields (sysname, nodename, release,
+// version, machine). _UTSNAME_FIELD_SIZE = 256 (usr/include/sys/utsname.h).
+const UTS_NMLN: u32 = 256;
 
 fn sysUname(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
@@ -970,6 +985,49 @@ fn sysUname(runner: *machine.Runner) bool {
 
 fn writeField(memory: *mem.Memory, addr: u32, s: []const u8) void {
     for (s, 0..) |c, i| memory.write8(addr + @as(u32, @intCast(i)), c);
+}
+
+/// Write a NUL-terminated string into a guest (buf, len) pair, clamped to len.
+/// Returns 0 on success, EFAULT if the buffer is unusable.
+fn writeNameBuf(runner: *machine.Runner, bufptr: u32, len: u32, s: []const u8) u32 {
+    if (bufptr == 0 or @as(u64, bufptr) + len > mem.Memory.size) return EFAULT;
+    const n: u32 = @min(@as(u32, @intCast(s.len)), if (len > 0) len - 1 else 0);
+    const was = runner.memory.enforce;
+    runner.memory.enforce = false;
+    defer runner.memory.enforce = was;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) runner.memory.write8(bufptr + i, s[i]);
+    runner.memory.write8(bufptr + n, 0);
+    return 0;
+}
+
+/// dg_gethostname(buf, len) — used by hostname(1).
+fn sysGethostname(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const buf = dgux.arg(cpu, 0);
+    const len = dgux.arg(cpu, 1);
+    const e = writeNameBuf(runner, buf, len, "run88k");
+    if (e != 0) dgux.returnError(cpu, e) else dgux.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// dg_getdomainname(buf, len).
+fn sysGetdomainname(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const buf = dgux.arg(cpu, 0);
+    const len = dgux.arg(cpu, 1);
+    const e = writeNameBuf(runner, buf, len, "localdomain");
+    if (e != 0) dgux.returnError(cpu, e) else dgux.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// dg_process_info(...) — a DG-native multiplexed process-info query. We don't
+/// model the process table; return 0 (success, no info) so callers that use it
+/// for supplementary data (e.g. logname's fallback) proceed to their defaults.
+fn sysProcessInfo(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    dgux.returnSuccess(cpu, 0);
+    return true;
 }
 
 // -- ioctl -------------------------------------------------------------------

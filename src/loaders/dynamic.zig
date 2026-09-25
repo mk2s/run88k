@@ -65,10 +65,15 @@ const DT_STRSZ = 10;
 const DT_SYMENT = 11;
 const DT_JMPREL = 23;
 
-// m88k relocation types.
-const R_88K_COPY = 1;
-const R_88K_JMP_SLOT = 2;
-const R_88K_RELATIVE = 16;
+// m88k relocation types (authoritative: DG/UX usr/include/sys/elf_88K.h).
+const R_88K_COPY = 1; // copy symbol bytes into exe .bss
+const R_88K_JMP_SLOT = 2; // R_88K_GOTP_ENT: resolve fn into GOTP slot
+const R_88K_BBASED_32 = 16; // *addr = value + bias   (a.k.a. our "RELATIVE")
+const R_88K_BBASED_16H = 18; // *(u16)addr = (value + bias) >> 16
+const R_88K_BBASED_16L = 19; // *(u16)addr = (value + bias) & 0xffff
+const R_88K_32 = 32; // *addr = sym_value + addend (absolute)
+// Back-compat alias for the existing code paths that referenced RELATIVE.
+const R_88K_RELATIVE = R_88K_BBASED_32;
 
 // ELF32 symbol layout: st_name(4) st_value(4) st_size(4) st_info(1) st_other(1)
 // st_shndx(2) = 16 bytes.
@@ -249,6 +254,29 @@ pub const Linker = struct {
                         return error.UnresolvedSymbol;
                     };
                     self.memory.write32(r_offset, target);
+                },
+                R_88K_BBASED_16H, R_88K_BBASED_16L => {
+                    // Bias-based 16-bit halves: patch the immediate field of an
+                    // instruction pair (or.u rD,r0,HI ; or rD,rD,LO) with the
+                    // relocated address. The full value is symval + addend +
+                    // bias; for a local (sym 0) it is addend + bias. These
+                    // appear in .rela.plt (types 18/19 paired) — the PLT stub's
+                    // literal load of a GOT slot address.
+                    var full: u32 = undefined;
+                    if (r_sym != 0) {
+                        const info = self.symInfo(obj, r_sym);
+                        var name: [128]u8 = undefined;
+                        const nlen = self.copyName(obj, info.name_off, &name);
+                        const base = self.lookup(name[0..nlen]) orelse (info.value +% obj.bias);
+                        full = @bitCast(@as(i32, @bitCast(base)) +% r_addend);
+                    } else {
+                        full = @bitCast(@as(i32, @bitCast(obj.bias)) +% r_addend);
+                    }
+                    const half: u16 = if (r_type == R_88K_BBASED_16H)
+                        @truncate(full >> 16)
+                    else
+                        @truncate(full & 0xffff);
+                    self.memory.write16(r_offset, half);
                 },
                 R_88K_COPY => {
                     // Copy the library's initial bytes into the exe's .bss, and
@@ -638,6 +666,7 @@ fn loadLibrary(lk: *Linker, guest_path: []const u8, io: std.Io, gpa: std.mem.All
     lk.next_base += LIB_STRIDE;
 
     const obj = elf.mapSegments(lk.memory, image, bias) catch return error.LoadOutOfRange;
+    if (DBG) dbg("loadLibrary {s} bias={x}", .{ guest_path, bias });
     lk.objs[lk.n_objs] = .{ .bias = bias, .dynamic_vaddr = obj.dynamic_vaddr };
     lk.readDynamic(&lk.objs[lk.n_objs]);
     // Retain the library's .symtab/.strtab (non-ALLOC, so not in guest memory)
