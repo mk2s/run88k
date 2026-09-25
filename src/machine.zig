@@ -75,6 +75,12 @@ pub const Runner = struct {
     /// setrlimit, sys_local — alongside the main vector 450). The handler reads
     /// `cpu.last_exception` to tell them apart. 0xffffffff disables.
     syscall_vector2: u32 = 0xffff_ffff,
+
+    /// THIRD and FOURTH syscall trap vectors, same routing. DG/UX uses several
+    /// gates: 450 (std), 128 (dg-extended), 449 (local multiplexor), and 503
+    /// (a fast/internal trap). The handler dispatches on `cpu.last_exception`.
+    syscall_vector3: u32 = 0xffff_ffff,
+    syscall_vector4: u32 = 0xffff_ffff,
     /// A benign cache-control trap vector (m88k `tb0 0,r0,451` cacheflush, used
     /// by OpenBSD ld.so after writing PLT/relocations). Our memory is coherent,
     /// so it's a no-op: advance past the trap and continue. 0xffffffff disables.
@@ -213,7 +219,9 @@ pub const Runner = struct {
                 .trapped => {
                     self.last_trap = self.cpu.last_exception;
                     if (self.cpu.last_exception == self.syscall_vector or
-                        self.cpu.last_exception == self.syscall_vector2)
+                        self.cpu.last_exception == self.syscall_vector2 or
+                        self.cpu.last_exception == self.syscall_vector3 or
+                        self.cpu.last_exception == self.syscall_vector4)
                     {
                         if (self.handler) |h| {
                             if (!h(self)) {

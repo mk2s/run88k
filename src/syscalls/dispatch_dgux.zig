@@ -127,7 +127,77 @@ pub fn dispatch(runner: *machine.Runner) bool {
     return switch (gate) {
         .std => dispatchStd(runner),
         .ext => dispatchExt(runner),
+        .local => dispatchLocal(runner),
+        .fast => dispatchFast(runner),
+        .sigret => {
+            // sigreturn (vector 448): no signal delivery yet, so nothing to
+            // restore. Skip the trap and continue.
+            const at = cpu.ppc +% 4;
+            cpu.branch_pending = false;
+            cpu.pc = at;
+            cpu.npc = at +% 4;
+            return true;
+        },
     };
+}
+
+// -- gate 0x1c1 (449): local multiplexor ------------------------------------
+
+// Numbers (in r9, with r8=2) recovered from libc.so.1 stubs: 1,2,3,4. These
+// are the getrlimit/setrlimit-family "local" calls (matching the UTek local
+// vector). getrlimit(resource, rlp): resource in r2, rlp in r3.
+const LOCAL_1: u32 = 1;
+const LOCAL_GETRLIMIT: u32 = 2;
+const LOCAL_3: u32 = 3;
+const LOCAL_4: u32 = 4;
+
+fn dispatchLocal(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const num = dgux.syscallNumber(cpu);
+    if (trace) traceSyscall("local", num, "local", cpu);
+    switch (num) {
+        LOCAL_GETRLIMIT => {
+            const resource = dgux.arg(cpu, 0);
+            const rlp = dgux.arg(cpu, 1);
+            const cur: u32, const max: u32 = switch (resource) {
+                5 => .{ fsmod.MAX_FD, fsmod.MAX_FD }, // RLIMIT_NOFILE
+                3 => .{ 0x0010_0000, 0x0010_0000 }, // RLIMIT_STACK
+                else => .{ RLIM_INFINITY, RLIM_INFINITY },
+            };
+            if (rlp != 0 and @as(u64, rlp) + 8 <= mem.Memory.size) {
+                const was = runner.memory.enforce;
+                runner.memory.enforce = false;
+                runner.memory.write32(rlp + 0, cur);
+                runner.memory.write32(rlp + 4, max);
+                runner.memory.enforce = was;
+            }
+            dgux.returnSuccess(cpu, 0);
+            return true;
+        },
+        LOCAL_1, LOCAL_3, LOCAL_4 => {
+            // setrlimit / other local resource calls: accept and ignore (we
+            // don't enforce guest resource limits).
+            dgux.returnSuccess(cpu, 0);
+            return true;
+        },
+        else => {
+            dgux.returnError(cpu, ENOSYS);
+            return true;
+        },
+    }
+}
+
+// -- gate 0x1f7 (503): fast/internal trap ------------------------------------
+
+/// Vector 503 is a libc-internal fast trap that does not carry a syscall
+/// number in r9. Its uses in libc/the tools are benign from an emulation
+/// standpoint (cache/scheduling hints, fast time reads). Accept it as a no-op
+/// success and continue, so tools relying on it proceed.
+fn dispatchFast(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    if (trace) traceSyscall("fast", 0, "fast503", cpu);
+    dgux.returnSuccess(cpu, 0);
+    return true;
 }
 
 // -- gate 0x1c2: standard SVR4 table -----------------------------------------
@@ -654,7 +724,12 @@ const STAT_SIZE: u32 = 128;
 
 fn writeGuestStat(memory: *mem.Memory, addr: u32, hs: *const HostStat) void {
     memory.zero(addr, STAT_SIZE);
-    memory.write32(addr + 0, hs.dev); // st_dev
+    // Present the entire guest namespace as ONE device. The host backs mounts
+    // with several real filesystems (different st_dev), but the guest must see
+    // a single coherent filesystem or a getcwd() walk that compares (dev,ino)
+    // to detect the root — and to match a parent entry against '.' — fails
+    // across mount boundaries.
+    memory.write32(addr + 0, 1); // st_dev (virtual, constant)
     memory.write32(addr + 4, hs.ino); // st_ino
     memory.write32(addr + 8, hs.mode); // st_mode (S_IF* match host)
     memory.write32(addr + 12, hs.nlink); // st_nlink
@@ -724,6 +799,11 @@ fn sysStat(runner: *machine.Runner) bool {
     }
     var hs: HostStat = undefined;
     r88k_stat(cpath, &hs);
+    if (trace) {
+        var tb: [1152]u8 = undefined;
+        const tl = std.fmt.bufPrint(&tb, "  stat '{s}' ok={d} ino={d}\n", .{ gpath, hs.ok, hs.ino }) catch "";
+        traceOut(tl);
+    }
     if (hs.ok == 0) {
         dgux.returnError(cpu, mapErrno(@intCast(hs.err)));
         return true;
@@ -781,6 +861,7 @@ fn sysGetdents(runner: *machine.Runner) bool {
         }
     }.one;
 
+    const dirpath: ?[]const u8 = fs.dirGuestPath(gfd);
     var real_done = false;
     while (true) {
         var ino: c_ulong = 0;
@@ -791,7 +872,22 @@ fn sysGetdents(runner: *machine.Runner) bool {
             break;
         }
         const name = std.mem.sliceTo(&namebuf, 0);
-        if (!emit(runner, buf, &written, nbyte, @intCast(ino & 0xffffffff), name)) {
+        // If this entry is itself a mount point (a mount overlaying a real
+        // host directory), report the MOUNTED dir's inode instead of the
+        // shadowed real one, so a getcwd() inode-match walk succeeds.
+        var dino: u32 = @intCast(ino & 0xffffffff);
+        if (dirpath) |dp| {
+            if (fs.mountAt(dp, name)) |host_root| {
+                var hs: HostStat = undefined;
+                var rootz: [1024]u8 = undefined;
+                const rn = @min(host_root.len, rootz.len - 1);
+                @memcpy(rootz[0..rn], host_root[0..rn]);
+                rootz[rn] = 0;
+                r88k_stat(@ptrCast(&rootz), &hs);
+                if (hs.ok != 0) dino = hs.ino;
+            }
+        }
+        if (!emit(runner, buf, &written, nbyte, dino, name)) {
             fs.dirPushback(handle);
             break;
         }
@@ -804,8 +900,8 @@ fn sysGetdents(runner: *machine.Runner) bool {
     // the mount point returns — this is what a userland getcwd() relies on to
     // climb across the mount boundary.
     if (real_done) {
-        if (fs.dirGuestPath(gfd)) |dirpath| {
-            while (fs.mountChild(dirpath, fs.dirSynthNext(gfd))) |child| {
+        if (dirpath) |dp2| {
+            while (fs.mountChild(dp2, fs.dirSynthNext(gfd))) |child| {
                 var hs: HostStat = undefined;
                 var rootz: [1024]u8 = undefined;
                 const rn = @min(child.host_root.len, rootz.len - 1);
@@ -1037,11 +1133,13 @@ fn sysGetcwd(runner: *machine.Runner) bool {
         return true;
     };
     const cwd = fs.cwdPath();
-    // Pick the buffer pointer: prefer arg0 if it looks like a valid guest
-    // address, else arg1 (some variants pass (size, buf)).
-    const a0 = dgux.arg(cpu, 0);
+    // The static SDE libc stub puts the buffer in r3 (arg1) and passes r2=-1
+    // as a sentinel (verified by disassembling as-v2: `or r3,r0,r2` places the
+    // caller's buf in r3, then `or r5,r0,r3` before the trap; the caller reads
+    // buf[0] and errors if it is 0). So the buffer is arg1.
     const a1 = dgux.arg(cpu, 1);
-    const bufptr: u32 = if (a0 != 0 and a0 < mem.Memory.size) a0 else a1;
+    const a0 = dgux.arg(cpu, 0);
+    const bufptr: u32 = if (a1 != 0 and @as(u64, a1) < mem.Memory.size) a1 else a0;
     if (bufptr == 0 or @as(u64, bufptr) + cwd.len + 1 > mem.Memory.size) {
         dgux.returnError(cpu, EINVAL);
         return true;

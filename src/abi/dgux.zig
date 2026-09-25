@@ -45,6 +45,18 @@ pub const syscall_vector: u32 = 450;
 /// DG-extended syscall gate: `tb0 0, r0, 0x080` -> exception vector 128.
 pub const syscall_vector_ext: u32 = 128;
 
+/// Local multiplexor gate: `tb0 0, r0, 0x1c1` -> vector 449. A small set of
+/// calls (numbers 1..4 in r9, with r8=2) — getrlimit/setrlimit family, like
+/// UTek's "local" vector.
+pub const syscall_vector_local: u32 = 449;
+
+/// Fast/internal trap gate: `tb0 0, r0, 0x1f7` -> vector 503. Used heavily by
+/// libc internals; does not carry a syscall number in r9.
+pub const syscall_vector_fast: u32 = 503;
+
+/// Signal-return gate: `tb0 0, r0, 0x1c0` -> vector 448 (sigreturn).
+pub const syscall_vector_sigret: u32 = 448;
+
 /// Register indices (DG/UX = m88k SVR4).
 pub const R_NUM: u5 = 9; // syscall number (same as SysV/88, UTek)
 pub const R_RET: u5 = 2; // return value (and first arg)
@@ -53,7 +65,7 @@ pub const R_ARG_LAST: u5 = 9;
 pub const PSR_CARRY_BIT: u5 = 28;
 
 /// Which trap gate a given exception vector represents.
-pub const Gate = enum { std, ext };
+pub const Gate = enum { std, ext, local, fast, sigret };
 
 /// Classify the trapping exception vector into a gate. Returns null if the
 /// vector is not a DG/UX syscall gate.
@@ -61,6 +73,9 @@ pub fn gateOf(vector: u32) ?Gate {
     return switch (vector) {
         syscall_vector => .std,
         syscall_vector_ext => .ext,
+        syscall_vector_local => .local,
+        syscall_vector_fast => .fast,
+        syscall_vector_sigret => .sigret,
         else => null,
     };
 }

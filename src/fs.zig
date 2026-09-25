@@ -425,6 +425,27 @@ pub const Fs = struct {
         return null;
     }
 
+    /// If the guest path `dir`/`name` is itself a mount point, return the
+    /// host backing root of that mount; else null. getdents uses this to
+    /// report the MOUNTED directory's inode for an entry that also exists as a
+    /// real (shadowed) child on the host — so a getcwd() inode-match walk sees
+    /// the same inode from stat(mountpoint) and from the parent's listing.
+    pub fn mountAt(self: *const Fs, dir: []const u8, name: []const u8) ?[]const u8 {
+        for (self.mounts.items) |m| {
+            const p = m.guest_prefix;
+            if (std.mem.eql(u8, p, "/")) continue;
+            var slash: usize = p.len;
+            while (slash > 0 and p[slash - 1] != '/') slash -= 1;
+            const parent = if (slash <= 1) "/" else p[0 .. slash - 1];
+            const mname = p[slash..];
+            if (mname.len == 0) continue;
+            if (std.mem.eql(u8, parent, dir) and std.mem.eql(u8, mname, name)) {
+                return m.host_root;
+            }
+        }
+        return null;
+    }
+
     pub fn dirHandleFor(self: *const Fs, gfd: u32) ?c_int {
         if (gfd >= MAX_FD) return null;
         const h = self.dir_handle[gfd];

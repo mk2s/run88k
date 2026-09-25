@@ -215,9 +215,15 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
             // DG/UX has TWO syscall gates: 0x1c2 (450, standard) and 0x080
             // (128, DG-extended). Route both to the dgux dispatcher, which
             // reads cpu.last_exception to tell the gates apart.
-            runner.syscall_vector = dgux_abi.syscall_vector; // 450
-            runner.syscall_vector2 = dgux_abi.syscall_vector_ext; // 128
+            runner.syscall_vector = dgux_abi.syscall_vector; // 450 (std)
+            runner.syscall_vector2 = dgux_abi.syscall_vector_ext; // 128 (ext)
+            runner.syscall_vector3 = dgux_abi.syscall_vector_local; // 449 (local)
+            runner.syscall_vector4 = dgux_abi.syscall_vector_fast; // 503 (fast)
             runner.handler = &dispatch_dgux.dispatch;
+            // 448 (sigreturn) is also a DG/UX gate; route it too. The runner
+            // has four vector slots, so fold sigreturn into the cacheflush slot
+            // (both are "skip and continue" style) — the dispatcher handles it.
+            runner.cacheflush_vector = dgux_abi.syscall_vector_sigret;
         },
         .utek => unreachable, // handled by the early COFF branch above
     }
