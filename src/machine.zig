@@ -19,6 +19,12 @@ const std = @import("std");
 const m88k = @import("m88k");
 const mem = @import("mem.zig");
 
+/// Temporary debug: full per-instruction trace to stderr when set.
+pub var trace_all: bool = false;
+/// Temporary debug: watch writes to this guest address (0 = disabled).
+pub var watch_addr: u32 = 0;
+extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+
 const Cpu = m88k.Cpu;
 const StepResult = m88k.cpu.StepResult;
 
@@ -64,6 +70,11 @@ pub const Runner = struct {
     /// The active personality's syscall trap vector (SysV/88 = 451). A trap
     /// with this vector is dispatched to `handler`; any other trap is a fault.
     syscall_vector: u32 = 0xffff_ffff,
+    /// A SECOND syscall trap vector routed to the same handler (UTek uses
+    /// vector 449 for its "local"/Tektronix multiplexed calls — getrlimit,
+    /// setrlimit, sys_local — alongside the main vector 450). The handler reads
+    /// `cpu.last_exception` to tell them apart. 0xffffffff disables.
+    syscall_vector2: u32 = 0xffff_ffff,
     /// A benign cache-control trap vector (m88k `tb0 0,r0,451` cacheflush, used
     /// by OpenBSD ld.so after writing PLT/relocations). Our memory is coherent,
     /// so it's a no-op: advance past the trap and continue. 0xffffffff disables.
@@ -167,8 +178,28 @@ pub const Runner = struct {
         while (budget > 0) : (budget -= 1) {
             self.pc_ring[self.pc_ring_i % self.pc_ring.len] = self.cpu.pc;
             self.pc_ring_i +%= 1;
+            if (trace_all) {
+                var b: [160]u8 = undefined;
+                const s = std.fmt.bufPrint(&b, "PC={x} ir={x} r1={x} r2={x} r3={x} r9={x} r31={x}\n", .{
+                    self.cpu.pc, self.memory.read32(self.cpu.pc), self.cpu.getReg(1), self.cpu.getReg(2), self.cpu.getReg(3), self.cpu.getReg(9), self.cpu.getReg(31),
+                }) catch "";
+                _ = write(2, s.ptr, s.len);
+            }
+            var watch_before: u32 = 0;
+            if (watch_addr != 0 and watch_addr +% 4 < mem.Memory.size) {
+                watch_before = (@as(u32, self.memory.bytes[watch_addr]) << 24) | (@as(u32, self.memory.bytes[watch_addr + 1]) << 16) | (@as(u32, self.memory.bytes[watch_addr + 2]) << 8) | self.memory.bytes[watch_addr + 3];
+            }
+            const ppc_for_watch = self.cpu.pc;
             const result = m88k.step(&self.cpu);
             self.steps_run += 1;
+            if (watch_addr != 0 and watch_addr +% 4 < mem.Memory.size) {
+                const after = (@as(u32, self.memory.bytes[watch_addr]) << 24) | (@as(u32, self.memory.bytes[watch_addr + 1]) << 16) | (@as(u32, self.memory.bytes[watch_addr + 2]) << 8) | self.memory.bytes[watch_addr + 3];
+                if (after != watch_before) {
+                    var wb: [96]u8 = undefined;
+                    const ws = std.fmt.bufPrint(&wb, "WATCH {x}: {x} -> {x} at pc={x}\n", .{ watch_addr, watch_before, after, ppc_for_watch }) catch "";
+                    _ = write(2, ws.ptr, ws.len);
+                }
+            }
 
             // A memory fault during the step is fatal.
             if (self.memory.fault.kind != .none) {
@@ -181,7 +212,9 @@ pub const Runner = struct {
                 .halted => return .halted,
                 .trapped => {
                     self.last_trap = self.cpu.last_exception;
-                    if (self.cpu.last_exception == self.syscall_vector) {
+                    if (self.cpu.last_exception == self.syscall_vector or
+                        self.cpu.last_exception == self.syscall_vector2)
+                    {
                         if (self.handler) |h| {
                             if (!h(self)) {
                                 // Handler asked to stop: exit or abort.

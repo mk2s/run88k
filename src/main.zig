@@ -14,11 +14,14 @@ const m88k = @import("m88k");
 const mem = @import("mem.zig");
 const machine = @import("machine.zig");
 const elf = @import("loaders/elf.zig");
+const coff = @import("loaders/coff.zig");
 const process = @import("process.zig");
 const sysv = @import("abi/sysv88.zig");
 const obsd = @import("abi/openbsd.zig");
+const utek = @import("abi/utek.zig");
 const dispatch = @import("syscalls/dispatch.zig");
 const dispatch_openbsd = @import("syscalls/dispatch_openbsd.zig");
+const dispatch_utek = @import("syscalls/dispatch_utek.zig");
 const difftrace = @import("difftrace.zig");
 const fsmod = @import("fs.zig");
 const dynamic = @import("loaders/dynamic.zig");
@@ -52,13 +55,22 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[i], "--trace")) {
             dispatch.trace = true;
             dispatch_openbsd.trace = true;
+            dispatch_utek.trace = true;
+        } else if (std.mem.eql(u8, args[i], "--trace-all")) {
+            // Per-instruction PC/register trace to stderr (deep core debugging).
+            machine.trace_all = true;
+        } else if (std.mem.eql(u8, args[i], "--watch") and i + 1 < args.len) {
+            machine.watch_addr = std.fmt.parseInt(u32, args[i + 1], 16) catch 0;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--os") and i + 1 < args.len) {
             if (std.mem.eql(u8, args[i + 1], "openbsd")) {
                 os_choice = .openbsd;
             } else if (std.mem.eql(u8, args[i + 1], "sysv88") or std.mem.eql(u8, args[i + 1], "sysv")) {
                 os_choice = .sysv88;
+            } else if (std.mem.eql(u8, args[i + 1], "utek")) {
+                os_choice = .utek;
             } else {
-                outf("run88k: unknown --os '{s}' (use sysv88 or openbsd)\n", .{args[i + 1]});
+                outf("run88k: unknown --os '{s}' (use sysv88, openbsd or utek)\n", .{args[i + 1]});
                 return;
             }
             i += 1;
@@ -129,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Guest OS personality.
-const Os = enum { sysv88, openbsd };
+const Os = enum { sysv88, openbsd, utek };
 
 /// Load base for the OpenBSD interpreter (/usr/libexec/ld.so). Chosen above the
 /// exec + heap and below the mmap bump region (0x08000000) and stack
@@ -151,12 +163,8 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     defer memory.deinit();
     defer mem.setActive(null);
 
-    const img = elf.load(&memory, image) catch |e| {
-        outf("run88k: cannot load '{s}': {s}\n", .{ path, @errorName(e) });
-        return 126;
-    };
-
     // Guest filesystem (mount table + fd table), if any mounts were given.
+    // Built before loading so the COFF/UTek path can use it too.
     var fs: ?fsmod.Fs = null;
     if (mounts.len > 0) {
         fs = try fsmod.Fs.init(gpa);
@@ -167,6 +175,18 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
         };
     }
     defer if (fs) |*f| f.deinit();
+
+    // Tektronix UTek XD88: a static 88K BCS COFF binary. Detected by the COFF
+    // magic (or forced with --os utek). This is a self-contained path — UTek
+    // binaries are statically linked, so there is no dynamic-linking branch.
+    if (os_choice == .utek or (os_choice == null and coff.detect(image))) {
+        return cmdRunUtek(&memory, image, path, argv, if (fs) |*f| f else null, io, gpa);
+    }
+
+    const img = elf.load(&memory, image) catch |e| {
+        outf("run88k: cannot load '{s}': {s}\n", .{ path, @errorName(e) });
+        return 126;
+    };
 
     // Select the personality: explicit --os wins, else auto-detect from the
     // ELF (OpenBSD markers -> openbsd, otherwise SysV/88).
@@ -186,6 +206,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
             // treat it as a benign no-op (our memory is coherent).
             runner.cacheflush_vector = 451;
         },
+        .utek => unreachable, // handled by the early COFF branch above
     }
     if (fs) |*f| runner.fs = f;
 
@@ -245,6 +266,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
                 interp_base = OBSD_LDSO_BASE;
                 start_pc = ldobj.entry; // biased ld.so entry
             },
+            .utek => unreachable, // UTek is static-only, handled earlier
         }
     }
 
@@ -273,6 +295,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
                 return 126;
             };
         },
+        .utek => unreachable, // handled by the early COFF branch above
     }
 
     // Enforce permissions now that loading + stack setup are done.
@@ -298,6 +321,76 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
                 outf("{x} ", .{runner.pc_ring[(runner.pc_ring_i + k) % runner.pc_ring.len]});
             }
             out("\n");
+            return 124;
+        },
+        .trap => {
+            outf("run88k: unexpected trap vector {d} at ppc={x} (not the syscall vector)\n", .{ runner.last_trap, runner.cpu.ppc });
+            return 132;
+        },
+    }
+}
+
+/// Load and run a Tektronix UTek XD88 binary: a static 88K BCS COFF
+/// executable. Self-contained (no dynamic linking): load the COFF image, set
+/// up the SysV-style register handoff with a UTek exit trampoline, install the
+/// UTek dispatcher (vector 450, number r9), and run.
+fn cmdRunUtek(
+    memory: *mem.Memory,
+    image: []const u8,
+    path: []const u8,
+    argv: []const []const u8,
+    fs: ?*fsmod.Fs,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+) !u32 {
+    const img = coff.load(memory, image) catch |e| {
+        outf("run88k: cannot load '{s}' as 88K BCS COFF: {s}\n", .{ path, @errorName(e) });
+        return 126;
+    };
+
+    var runner = machine.Runner.init(memory);
+    runner.attachBus(); // sets bus + cpu.reset(); mem.active = memory
+    runner.syscall_vector = utek.syscall_vector; // 450 (main syscalls)
+    runner.syscall_vector2 = utek.syscall_vector_local; // 449 (getrlimit/setrlimit/sys_local)
+    runner.handler = &dispatch_utek.dispatch;
+    if (fs) |f| runner.fs = f;
+
+    // Process model (fork/exec/wait/pipe), when a mount table is present.
+    var pm: ?procmodel.HostProcess = null;
+    if (fs) |f| {
+        pm = procmodel.HostProcess.init(&runner, f, io, gpa);
+        pm.?.utek = true; // exec loads static 88K BCS COFF via the UTek path
+        runner.procmodel = &pm.?;
+    }
+
+    const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
+    process.setupUtek(&runner, img.entry, img.brk, argv, &envp) catch |e| {
+        outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
+        return 126;
+    };
+
+    memory.enforce = true;
+
+    if (dispatch_utek.trace) {
+        outf("run88k: [utek] entry={x} brk={x} argc={d}\n", .{ img.entry, img.brk, argv.len });
+    }
+
+    const reason = runner.run(machine.Runner.default_max_steps);
+    switch (reason) {
+        .exited => return runner.exit_status orelse 0,
+        .halted => return 0,
+        .fault => {
+            faultReport(&runner);
+            out("recent PCs: ");
+            var k: usize = 0;
+            while (k < runner.pc_ring.len) : (k += 1) {
+                outf("{x} ", .{runner.pc_ring[(runner.pc_ring_i + k) % runner.pc_ring.len]});
+            }
+            out("\n");
+            return 139;
+        },
+        .timed_out => {
+            outf("run88k: guest timed out after {d} instructions (runaway?)\n", .{runner.steps_run});
             return 124;
         },
         .trap => {

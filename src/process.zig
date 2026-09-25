@@ -201,6 +201,71 @@ pub fn setup(
     runner.setPc(entry);
 }
 
+/// Tektronix UTek XD88 process setup. UTek's `_start` uses the SAME register
+/// handoff as SysV/88 (r2=argc, r3=argv, r4=envp, r6=0, r31=SP; confirmed from
+/// crt0.o and a linked /bin/echo entry). The ONLY difference from setup() is
+/// the halt-pad exit stub, which must issue UTek's syscall trap: SYS_exit is
+/// number 9 in r9, trap vector 450 (`tb0 0,r0,450`), not SysV/88's 1 / 451.
+pub fn setupUtek(
+    runner: *machine.Runner,
+    entry: u32,
+    brk: u32,
+    argv: []const []const u8,
+    envp: []const []const u8,
+) StartError!void {
+    const memory = runner.memory;
+
+    memory.addRegion(stack_top - stack_size, stack_size, .{ .read = true, .write = true }) catch return error.OutOfStack;
+    memory.addRegion(halt_pad, 8, .{ .read = true, .exec = true }) catch return error.OutOfStack;
+
+    // Low "zero page": UTek maps a readable page at address 0 (classic
+    // pre-MMU-strict Unix behavior). Programs like `ld` rely on it — e.g. a
+    // strcmp against a null symbol name reads `*NULL == 0`, treats it as an
+    // empty string, and returns a mismatch instead of faulting. Map a small
+    // read-only zero region [0, 0x2000) below the lowest text vaddr (0x2200).
+    // NOT writable, so a null STORE still faults (a real bug the guest'd hit).
+    memory.addRegion(0, 0x2000, .{ .read = true, .write = false }) catch return error.OutOfStack;
+
+    {
+        const w = memory.enforce;
+        memory.enforce = false;
+        memory.zero(brk, initial_heap);
+        memory.enforce = w;
+    }
+    memory.addRegion(brk, initial_heap, .{ .read = true, .write = true }) catch return error.OutOfStack;
+    runner.brk = brk + initial_heap;
+    runner.brk_base = brk;
+
+    // Halt pad: UTek SYS_exit stub (`addu r9,r0,9; tb0 0,r0,450`) so a stray
+    // `jmp r1` out of _start terminates cleanly.
+    {
+        const w = memory.enforce;
+        memory.enforce = false;
+        memory.write32(halt_pad + 0, (@as(u32, 0x18) << 26) | (@as(u32, 9) << 21) | 9); // addu r9,r0,9
+        memory.write32(halt_pad + 4, 0xf000_d1c2); // tb0 0,r0,450
+        memory.enforce = w;
+    }
+
+    const layout = try buildStack(memory, argv, envp);
+
+    var ri: u5 = 0;
+    while (true) {
+        runner.setReg(ri, 0);
+        if (ri == 31) break;
+        ri += 1;
+    }
+    runner.cpu.branch_pending = false;
+
+    // Register handoff (identical to SysV/88).
+    runner.setReg(2, layout.argc); // r2 = argc
+    runner.setReg(3, layout.argv_ptr); // r3 = argv
+    runner.setReg(4, layout.envp_ptr); // r4 = envp
+    runner.setReg(6, 0); // r6 = cleanup fn (none)
+    runner.setReg(machine.Reg.sp, layout.sp); // r31 = SP
+    runner.setReg(machine.Reg.link, halt_pad); // r1 = return address -> halt pad
+    runner.setPc(entry);
+}
+
 /// OpenBSD/luna88k process setup. Unlike SysV/88, OpenBSD's `_start` reads
 /// argc/argv/envp off the STACK itself (r2=mem[sp], r3=sp+4, envp derived) and
 /// does NOT rely on a register handoff. So we build the same stack image via

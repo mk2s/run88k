@@ -8,12 +8,16 @@ test {
     _ = @import("machine.zig");
     _ = @import("process.zig");
     _ = @import("loaders/elf.zig");
+    _ = @import("loaders/coff.zig");
     _ = @import("abi/sysv88.zig");
     _ = @import("abi/openbsd.zig");
+    _ = @import("abi/utek.zig");
     _ = @import("syscalls/dispatch.zig");
     _ = @import("syscalls/dispatch_openbsd.zig");
+    _ = @import("syscalls/dispatch_utek.zig");
     _ = @import("syscalls/table_sysv88.zig");
     _ = @import("syscalls/table_openbsd.zig");
+    _ = @import("syscalls/table_utek.zig");
     _ = @import("difftrace.zig");
     _ = @import("fs.zig");
     _ = @import("loaders/dynamic.zig");

@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const mem = @import("mem.zig");
 const machine = @import("machine.zig");
 const elf = @import("loaders/elf.zig");
+const coff = @import("loaders/coff.zig");
 const process = @import("process.zig");
 const sysv = @import("abi/sysv88.zig");
 const fsmod = @import("fs.zig");
@@ -56,6 +57,10 @@ pub const HostProcess = struct {
     /// True when running an OpenBSD guest: exec must map ld.so + build the ELF
     /// aux vector + use the stack-based startup instead of the SysV path.
     openbsd: bool = false,
+    /// True when running a UTek guest: executables are static 88K BCS COFF, so
+    /// exec loads via the COFF loader and uses the UTek register-handoff
+    /// startup (setupUtek) instead of the ELF path.
+    utek: bool = false,
     /// A small ring of already-reaped children awaiting a guest wait4.
     ///
     /// SIGCHLD delivery peeks for a reapable child before jumping to the
@@ -208,6 +213,37 @@ pub const HostProcess = struct {
             return self.execShebang(image, path, argv, envp, depth);
         }
 
+        // UTek: static 88K BCS COFF. Load via the COFF loader and use the UTek
+        // register-handoff startup. (The cc driver execs /lib/cpp, /lib/comp,
+        // /bin/as, /bin/ld — all COFF or shebang scripts handled above.)
+        if (self.utek and coff.detect(image)) {
+            const memory = self.runner.memory;
+            memory.clearRegions();
+            memory.enforce = false;
+            @memset(memory.bytes, 0);
+            const cimg = coff.load(memory, image) catch return error.ExecFailed;
+            self.runner.brk = cimg.brk;
+            self.runner.brk_base = cimg.brk;
+            self.runner.mmap_next = 0x0800_0000;
+            // setupUtek maps the readable low zero page (address 0) UTek relies
+            // on (e.g. ld's strcmp of null symbol names) — see process.zig.
+            process.setupUtek(self.runner, cimg.entry, cimg.brk, argv, envp) catch return error.ExecFailed;
+            memory.enforce = true;
+            self.new_brk = cimg.brk;
+            self.exec_entry = cimg.entry;
+            return;
+        }
+
+        // Shell fallback: a UTek executable that is neither COFF nor ELF and
+        // has no `#!` line is a shell script (many UTek utilities — basename,
+        // dirname, true, false — start with a `#ident` comment, no shebang).
+        // The kernel/exec convention runs such a file via /bin/sh. Re-exec as
+        // `/bin/sh <script> <orig args...>`.
+        if (self.utek and !coff.detect(image) and !isElf(image)) {
+            if (depth >= max_shebang_depth) return error.ExecFailed;
+            return self.execShellScript(path, argv, envp, depth);
+        }
+
         // Validate before clobbering memory.
         elf.checkHeader(image) catch return error.ExecFailed;
 
@@ -268,6 +304,39 @@ pub const HostProcess = struct {
         memory.enforce = true;
         self.new_brk = img.brk;
         self.exec_entry = img.entry;
+    }
+
+    /// True if the image begins with the ELF magic.
+    fn isElf(image: []const u8) bool {
+        return image.len >= 4 and image[0] == 0x7f and image[1] == 'E' and image[2] == 'L' and image[3] == 'F';
+    }
+
+    /// Run a shebang-less shell script by re-execing `/bin/sh <script> <args>`.
+    /// argv[0] is preserved as the script's own name (argv[1..] appended).
+    fn execShellScript(
+        self: *HostProcess,
+        script_path: []const u8,
+        argv: []const []const u8,
+        envp: []const []const u8,
+        depth: u32,
+    ) ProcError!void {
+        var script_buf: [1024]u8 = undefined;
+        if (script_path.len >= script_buf.len) return error.ExecFailed;
+        @memcpy(script_buf[0..script_path.len], script_path);
+        const script_s = script_buf[0..script_path.len];
+
+        var new_argv: [128][]const u8 = undefined;
+        var n: usize = 0;
+        new_argv[n] = "/bin/sh";
+        n += 1;
+        new_argv[n] = script_s;
+        n += 1;
+        var i: usize = 1; // append the original args (skip the old argv[0])
+        while (i < argv.len and n < new_argv.len) : (i += 1) {
+            new_argv[n] = argv[i];
+            n += 1;
+        }
+        return self.doExecDepth("/bin/sh", new_argv[0..n], envp, depth + 1);
     }
 
     /// Handle a `#!interpreter [arg]` script: parse the first line, then re-exec
