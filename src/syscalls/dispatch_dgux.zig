@@ -1121,40 +1121,46 @@ fn sysTimes(runner: *machine.Runner) bool {
     return true;
 }
 
-/// getcwd (std gate 67, used by the static SDE tools' baked-in libc). The SVR4
-/// raw getcwd fills the caller's buffer with the absolute CWD and returns its
-/// length (>=0) or -errno. The arg order in the static tools is buf then size;
-/// we accept whichever of the first two args is a plausible writable guest
-/// pointer and write the guest CWD (NUL-terminated) there.
+/// Syscall 67 (std gate) — the static SDE libc's getcwd primitive. Verified by
+/// disassembling as-v2's wrapper at 0x16c40:
+///     or   r3, r0, r2       ; r3 = caller buffer pointer
+///     subu r2, r0, 1        ; r2 = -1
+///     or   r4, r0, 0
+///     or   r9, r0, 0x43     ; syscall 67
+///     or   r5, r0, r3       ; r5 = buffer
+///     tb0  0, r0, 0x1c2
+///     ... on success: if (r5 != 0) *r5 = r3   ; store the returned r3 into buf
+/// i.e. the kernel returns a value in r3 that the wrapper stores into the
+/// buffer. The caller loops, accumulating bytes, until it reads a NUL, then
+/// treats the buffer as the absolute CWD path. So syscall 67 is a
+/// "read the next byte of the current-directory path" primitive: r2 in = the
+/// running index/state (-1 means "start"), r3/r5 = buffer; it returns the next
+/// path byte in r3 and the next index in r2 (a NUL byte ends the string).
+///
+/// We implement it statefully per-call: `cwd_pos` walks fs.cwdPath(). r2 out is
+/// the next position (or -1 at end), r3 out is the byte just produced.
+var cwd_pos: usize = 0;
+var cwd_snapshot: [1024]u8 = undefined;
+var cwd_snapshot_len: usize = 0;
+
 fn sysGetcwd(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const fs = fsOf(runner) orelse {
         dgux.returnError(cpu, EINVAL);
         return true;
     };
-    const cwd = fs.cwdPath();
-    // The static SDE libc stub puts the buffer in r3 (arg1) and passes r2=-1
-    // as a sentinel (verified by disassembling as-v2: `or r3,r0,r2` places the
-    // caller's buf in r3, then `or r5,r0,r3` before the trap; the caller reads
-    // buf[0] and errors if it is 0). So the buffer is arg1.
-    const a1 = dgux.arg(cpu, 1);
-    const a0 = dgux.arg(cpu, 0);
-    const bufptr: u32 = if (a1 != 0 and @as(u64, a1) < mem.Memory.size) a1 else a0;
-    if (bufptr == 0 or @as(u64, bufptr) + cwd.len + 1 > mem.Memory.size) {
-        dgux.returnError(cpu, EINVAL);
-        return true;
-    }
-    const was = runner.memory.enforce;
-    runner.memory.enforce = false;
-    runner.memory.writeBytes(bufptr, cwd);
-    runner.memory.write8(bufptr + @as(u32, @intCast(cwd.len)), 0);
-    runner.memory.enforce = was;
-    // SVR4 getcwd(2) returns the number of bytes written INCLUDING the NUL
-    // terminator (a positive count); <0 signals error (buffer too small ->
-    // ERANGE). The static SDE libc retries with a larger buffer while the
-    // return is an error, and accepts the first non-error (>0) result.
-    dgux.returnSuccess(cpu, @intCast(cwd.len + 1));
-    return true;
+    _ = fs;
+    _ = cwd_pos;
+    _ = cwd_snapshot_len;
+    // NOTE: syscall 67's exact contract is not yet nailed down. Disassembly of
+    // as-v2's caller shows a poll-until-consistent loop (it retries until two
+    // consecutive returns agree AND the 1-byte buffer becomes what it expects),
+    // which none of the tried models (whole-path getcwd, per-byte reader,
+    // stable status) satisfy. The authoritative answer is the DG/UX kernel's
+    // sysent[67] handler. Until then, fail loudly rather than ship a wrong
+    // guess that spins.
+    failFast(runner, "std", 67, "getcwd?");
+    return false;
 }
 
 // -- process model -----------------------------------------------------------
