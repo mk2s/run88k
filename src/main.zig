@@ -19,9 +19,11 @@ const process = @import("process.zig");
 const sysv = @import("abi/sysv88.zig");
 const obsd = @import("abi/openbsd.zig");
 const utek = @import("abi/utek.zig");
+const dgux_abi = @import("abi/dgux.zig");
 const dispatch = @import("syscalls/dispatch.zig");
 const dispatch_openbsd = @import("syscalls/dispatch_openbsd.zig");
 const dispatch_utek = @import("syscalls/dispatch_utek.zig");
+const dispatch_dgux = @import("syscalls/dispatch_dgux.zig");
 const difftrace = @import("difftrace.zig");
 const fsmod = @import("fs.zig");
 const dynamic = @import("loaders/dynamic.zig");
@@ -56,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
             dispatch.trace = true;
             dispatch_openbsd.trace = true;
             dispatch_utek.trace = true;
+            dispatch_dgux.trace = true;
         } else if (std.mem.eql(u8, args[i], "--trace-all")) {
             // Per-instruction PC/register trace to stderr (deep core debugging).
             machine.trace_all = true;
@@ -69,8 +72,10 @@ pub fn main(init: std.process.Init) !void {
                 os_choice = .sysv88;
             } else if (std.mem.eql(u8, args[i + 1], "utek")) {
                 os_choice = .utek;
+            } else if (std.mem.eql(u8, args[i + 1], "dgux")) {
+                os_choice = .dgux;
             } else {
-                outf("run88k: unknown --os '{s}' (use sysv88, openbsd or utek)\n", .{args[i + 1]});
+                outf("run88k: unknown --os '{s}' (use sysv88, openbsd, utek or dgux)\n", .{args[i + 1]});
                 return;
             }
             i += 1;
@@ -141,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Guest OS personality.
-const Os = enum { sysv88, openbsd, utek };
+const Os = enum { sysv88, openbsd, utek, dgux };
 
 /// Load base for the OpenBSD interpreter (/usr/libexec/ld.so). Chosen above the
 /// exec + heap and below the mmap bump region (0x08000000) and stack
@@ -206,6 +211,14 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
             // treat it as a benign no-op (our memory is coherent).
             runner.cacheflush_vector = 451;
         },
+        .dgux => {
+            // DG/UX has TWO syscall gates: 0x1c2 (450, standard) and 0x080
+            // (128, DG-extended). Route both to the dgux dispatcher, which
+            // reads cpu.last_exception to tell the gates apart.
+            runner.syscall_vector = dgux_abi.syscall_vector; // 450
+            runner.syscall_vector2 = dgux_abi.syscall_vector_ext; // 128
+            runner.handler = &dispatch_dgux.dispatch;
+        },
         .utek => unreachable, // handled by the early COFF branch above
     }
     if (fs) |*f| runner.fs = f;
@@ -266,6 +279,16 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
                 interp_base = OBSD_LDSO_BASE;
                 start_pc = ldobj.entry; // biased ld.so entry
             },
+            .dgux => {
+                // DG/UX dynamic binaries use the guest's own /usr/dglib
+                // ld.so; that path is a follow-on. For now self-link like
+                // SysV/88 (both are SVR4) so simple dynamic execs can load.
+                dynamic.reset();
+                dynamic.link(&memory, &fs.?, io, gpa, img.dynamic_vaddr, img.brk) catch |e| {
+                    outf("run88k: dynamic link failed: {s}\n", .{@errorName(e)});
+                    return 126;
+                };
+            },
             .utek => unreachable, // UTek is static-only, handled earlier
         }
     }
@@ -273,7 +296,9 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     // Environment: minimal for now.
     const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
     switch (os) {
-        .sysv88 => process.setup(&runner, start_pc, img.brk, argv, &envp) catch |e| {
+        .sysv88, .dgux => process.setup(&runner, start_pc, img.brk, argv, &envp) catch |e| {
+            // DG/UX static preinit uses the same SVR4 register handoff
+            // (r2=argc, r3=argv, r4=envp) — verified from its entry at 0x10011c.
             outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
             return 126;
         },
