@@ -507,6 +507,56 @@ pub const Linker = struct {
         return i;
     }
 
+    /// Synthesize COPY-reloc preemptions for data (OBJECT) symbols the
+    /// executable defines in its own .bss but does NOT have an explicit
+    /// R_88K_COPY reloc for. Some DG/UX toolchains lay out the exe's copy of
+    /// e.g. `__iob` (the stdio FILE array) as a plain .bss definition with no
+    /// COPY reloc; a NEEDED library (libdgc) then imports `__iob` as UNDEF.
+    /// Without unification, the exe's code writes its own uninitialized copy
+    /// while libc/libdgc use libc's copy, so a buffered FILE ends up with a
+    /// garbage (_ptr - _base) and stdout output loops/overflows.
+    ///
+    /// For each such symbol we do what a COPY reloc would: copy the defining
+    /// library's initial bytes into the exe's copy (so FILE flags / fd numbers
+    /// are correct) and register the exe address as the canonical preemption.
+    /// The existing passes (preemptLibraryData / preemptCopyRelocRanges /
+    /// initStdioRegistry) then point every library reference at the exe copy.
+    ///
+    /// Must run AFTER the exe's own RELA (pass 1, which records real COPY
+    /// preemptions) and BEFORE the libraries' relocs (pass 2), so their
+    /// JMP_SLOT/data relocs resolve the symbol to the exe's copy.
+    fn synthesizeCopyPreemptions(self: *Linker) void {
+        const exe = &self.objs[0];
+        if (exe.symtab == 0 or exe.nchain == 0) return;
+        var si: u32 = 1;
+        while (si < exe.nchain) : (si += 1) {
+            const sym = exe.symtab + si * SYMENT;
+            const st_shndx = self.memory.read16(sym + 14);
+            const st_name = self.memory.read32(sym + 0);
+            if (st_shndx == SHN_UNDEF or st_name == 0) continue;
+            const st_info = self.memory.read8(sym + 12);
+            if ((st_info & 0xf) != 1) continue; // STT_OBJECT only
+            const exe_addr = self.memory.read32(sym + 4); // exe bias 0
+            const exe_size = self.memory.read32(sym + 8);
+            if (exe_addr == 0 or exe_size == 0) continue;
+            var name: [128]u8 = undefined;
+            const nlen = self.copyName(exe, st_name, &name);
+            if (nlen == 0) continue;
+            // Already preempted by a real COPY reloc? then leave it.
+            if (self.preemptOf(name[0..nlen]) != null) continue;
+            // Only synthesize when a LIBRARY also defines this symbol (so there
+            // is a divergent copy to unify). Copy the library's initial bytes.
+            const src = self.lookupDefiningOther(name[0..nlen], exe) orelse continue;
+            const n = @min(exe_size, self.memory.read32(sym + 8));
+            var k: u32 = 0;
+            while (k < n) : (k += 1) {
+                self.memory.write8(exe_addr + k, self.memory.read8(src + k));
+            }
+            self.addPreempt(name[0..nlen], exe_addr);
+            if (DBG) dbg("synth-copy-preempt '{s}' exe={x} <- lib={x} size={x}", .{ name[0..nlen], exe_addr, src, n });
+        }
+    }
+
     /// Like lookup, but excludes `exclude` (used for COPY relocs: the value
     /// must come from a library, not the exe's own tentative slot).
     fn lookupDefiningOther(self: *Linker, name: []const u8, exclude: *const Object) ?u32 {
@@ -582,6 +632,12 @@ pub fn link(
         const exe = &lk.objs[0];
         if (exe.rela != 0 and exe.relasz != 0) try lk.applyRela(exe, exe.rela, exe.relasz);
     }
+
+    // Pass 1b: synthesize COPY-reloc preemptions for exe-defined data symbols
+    // (e.g. __iob) that a NEEDED library also defines but for which the exe has
+    // no explicit COPY reloc. Runs before the libraries' relocs so their
+    // references resolve to the exe's (now library-initialized) copy.
+    lk.synthesizeCopyPreemptions();
 
     // Pass 2: apply all remaining relocations for every object.
     var oi: usize = 0;

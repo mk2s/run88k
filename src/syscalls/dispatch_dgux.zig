@@ -329,6 +329,7 @@ fn dispatchExt(runner: *machine.Runner) bool {
         .dg_gethostname => return sysGethostname(runner),
         .dg_getdomainname => return sysGetdomainname(runner),
         .dg_process_info => return sysProcessInfo(runner),
+        .sysinfo => return sysSysinfo(runner),
 
         // Networking (sockets): not emulated. Return an error so callers fall
         // back to local files (e.g. id/logname query a name service via a
@@ -1018,6 +1019,43 @@ fn sysGetdomainname(runner: *machine.Runner) bool {
     const len = dgux.arg(cpu, 1);
     const e = writeNameBuf(runner, buf, len, "localdomain");
     if (e != 0) dgux.returnError(cpu, e) else dgux.returnSuccess(cpu, 0);
+    return true;
+}
+
+/// sysinfo(command, buf, count) — SVR4 system-information query. Writes a
+/// NUL-terminated string for the requested SI_* command into buf (clamped to
+/// count) and returns the byte count needed INCLUDING the NUL (SVR4 semantics;
+/// a return > count means truncated). Commands from usr/include/sys/systeminfo.h.
+fn sysSysinfo(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const command = dgux.arg(cpu, 0);
+    const buf = dgux.arg(cpu, 1);
+    const count = dgux.arg(cpu, 2);
+    const s: []const u8 = switch (command) {
+        1 => "dgux", // SI_SYSNAME
+        2 => "run88k", // SI_HOSTNAME
+        3 => "5.4", // SI_RELEASE
+        4 => "generic", // SI_VERSION
+        5 => "AViiON", // SI_MACHINE
+        6 => "m88k", // SI_ARCHITECTURE
+        7 => "0", // SI_HW_SERIAL
+        8 => "Data General", // SI_HW_PROVIDER
+        9 => "localdomain", // SI_SRPC_DOMAIN
+        else => {
+            dgux.returnError(cpu, EINVAL);
+            return true;
+        },
+    };
+    if (buf != 0 and count != 0 and @as(u64, buf) + count <= mem.Memory.size) {
+        const n: u32 = @min(@as(u32, @intCast(s.len)), count - 1);
+        const was = runner.memory.enforce;
+        runner.memory.enforce = false;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) runner.memory.write8(buf + i, s[i]);
+        runner.memory.write8(buf + n, 0);
+        runner.memory.enforce = was;
+    }
+    dgux.returnSuccess(cpu, @intCast(s.len + 1));
     return true;
 }
 
