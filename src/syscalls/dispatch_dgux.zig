@@ -226,7 +226,7 @@ fn dispatchStd(runner: *machine.Runner) bool {
         .bcs_time => return sysTime(runner),
         .times => return sysTimes(runner),
         .ulimit => return sysUlimit(runner),
-        .getcwd => return sysGetcwd(runner),
+        .waitpid => return sysWaitpid(runner),
         .sync => {
             dgux.returnSuccess(cpu, 0); // no-op: host fs is coherent
             return true;
@@ -304,6 +304,7 @@ fn dispatchExt(runner: *machine.Runner) bool {
 
     switch (sc) {
         .open => return sysOpen(runner),
+        .vfork => return sysVfork(runner),
         .fcntl => return sysFcntl(runner),
         .dg_ioctl => return sysDgIoctl(runner),
         .dg_mstat => return sysStat(runner), // dg_mstat(path, struct stat*) == stat
@@ -329,6 +330,21 @@ fn dispatchExt(runner: *machine.Runner) bool {
         .uname => return sysUname(runner),
         .dg_gethostname => return sysGethostname(runner),
         .dg_getdomainname => return sysGetdomainname(runner),
+        .getpgid, .getsid => {
+            dgux.returnSuccess(cpu, 1); // process group / session id = 1
+            return true;
+        },
+        .setpgrp, .fchdir => {
+            dgux.returnSuccess(cpu, 0);
+            return true;
+        },
+        .dg_sysmisc => {
+            // DG multiplexed misc query (selector in r2). We don't model the
+            // sub-operations; return 0 (a benign host id / "no info") so
+            // callers like hostid(1) print a value and exit cleanly.
+            dgux.returnSuccess(cpu, 0);
+            return true;
+        },
         .dg_process_info => return sysProcessInfo(runner),
         .sysinfo => return sysSysinfo(runner),
 
@@ -1237,46 +1253,30 @@ fn sysTimes(runner: *machine.Runner) bool {
     return true;
 }
 
-/// Syscall 67 (std gate) — the static SDE libc's getcwd primitive. Verified by
-/// disassembling as-v2's wrapper at 0x16c40:
-///     or   r3, r0, r2       ; r3 = caller buffer pointer
-///     subu r2, r0, 1        ; r2 = -1
-///     or   r4, r0, 0
+/// waitpid (std gate 67). Identified via libc's symbol table: the stub at
+/// libc 0x43aa8 is `waitpid`/`_waitpid`, NOT getcwd (getcwd is a separate
+/// ext-gate call). The stub is:
 ///     or   r9, r0, 0x43     ; syscall 67
-///     or   r5, r0, r3       ; r5 = buffer
+///     or   r5, r0, r3       ; r5 = statusp (arg1)
 ///     tb0  0, r0, 0x1c2
-///     ... on success: if (r5 != 0) *r5 = r3   ; store the returned r3 into buf
-/// i.e. the kernel returns a value in r3 that the wrapper stores into the
-/// buffer. The caller loops, accumulating bytes, until it reads a NUL, then
-/// treats the buffer as the absolute CWD path. So syscall 67 is a
-/// "read the next byte of the current-directory path" primitive: r2 in = the
-/// running index/state (-1 means "start"), r3/r5 = buffer; it returns the next
-/// path byte in r3 and the next index in r2 (a NUL byte ends the string).
-///
-/// We implement it statefully per-call: `cwd_pos` walks fs.cwdPath(). r2 out is
-/// the next position (or -1 at end), r3 out is the byte just produced.
-var cwd_pos: usize = 0;
-var cwd_snapshot: [1024]u8 = undefined;
-var cwd_snapshot_len: usize = 0;
-
-fn sysGetcwd(runner: *machine.Runner) bool {
+///     ... on success: if (r5 != 0) *r5 = r3   ; store returned status (r3)
+/// So it is a DUAL-RETURN waitpid(pid=r2, statusp=r3, options=r4): the kernel
+/// returns the reaped pid in r2 and the status word in r3, and the libc stub
+/// itself stores r3 into *statusp. The kernel must therefore NOT write the
+/// status buffer (the stub does it) — we only set r2:r3, exactly like the UTek
+/// waitpid.
+fn sysWaitpid(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
-    const fs = fsOf(runner) orelse {
+    const pm = pmOf(runner) orelse {
         dgux.returnError(cpu, EINVAL);
         return true;
     };
-    _ = fs;
-    _ = cwd_pos;
-    _ = cwd_snapshot_len;
-    // NOTE: syscall 67's exact contract is not yet nailed down. Disassembly of
-    // as-v2's caller shows a poll-until-consistent loop (it retries until two
-    // consecutive returns agree AND the 1-byte buffer becomes what it expects),
-    // which none of the tried models (whole-path getcwd, per-byte reader,
-    // stable status) satisfy. The authoritative answer is the DG/UX kernel's
-    // sysent[67] handler. Until then, fail loudly rather than ship a wrong
-    // guess that spins.
-    failFast(runner, "std", 67, "getcwd?");
-    return false;
+    const res = pm.doWait() catch {
+        dgux.returnError(cpu, ECHILD);
+        return true;
+    };
+    dgux.returnSuccess2(cpu, res.pid, res.status);
+    return true;
 }
 
 // -- process model -----------------------------------------------------------
@@ -1300,6 +1300,34 @@ fn sysFork(runner: *machine.Runner) bool {
         dgux.returnSuccess2(cpu, 0, 1); // child: r2=0, r3=1
     } else {
         dgux.returnSuccess2(cpu, rc, 0); // parent: r2=childpid, r3=0
+    }
+    return true;
+}
+
+/// vfork (ext gate 74). Like fork, but the libc stub (_abi_vfork @ libc
+/// 0x54a80) discriminates parent/child on r4, not r3: after the trap it does
+/// `cmp r4,0; if child: r2 = 0`. So the kernel returns the child pid in r2 for
+/// both and a flag in r4 (0 = parent, nonzero = child). We emulate vfork as a
+/// real host fork (correct as long as the child execs or exits promptly, which
+/// the toolchain drivers do).
+fn sysVfork(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        dgux.returnError(cpu, EINVAL);
+        return true;
+    };
+    const rc = pm.doFork() catch {
+        dgux.returnError(cpu, ENOMEM);
+        return true;
+    };
+    if (rc == 0) {
+        // child: r2 = 0 (pid), r4 = 1 (child flag)
+        cpu.setReg(4, 1);
+        dgux.returnSuccess(cpu, 0);
+    } else {
+        // parent: r2 = child pid, r4 = 0
+        cpu.setReg(4, 0);
+        dgux.returnSuccess(cpu, rc);
     }
     return true;
 }

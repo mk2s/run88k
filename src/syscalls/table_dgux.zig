@@ -82,8 +82,9 @@ pub const Std = enum(u32) {
     umask = 62,
     unlink = 64,
     utime = 66,
-    getcwd = 67, // no libc.so.1 stub (getcwd there uses the ext-gate path),
-    // but the STATIC SDE tools' baked-in libc traps getcwd as std #67.
+    waitpid = 67, // waitpid(pid, statusp, options); dual-return (pid r2, status
+    // r3). The libc stub stores the returned r3 into *statusp. (Earlier this
+    // was mislabeled getcwd; getcwd is a separate ext-gate call at libc 0x4ee48.)
     write = 68,
     _,
 };
@@ -105,6 +106,7 @@ pub const Ext = enum(u32) {
     vfork = 74, // libc stub `_abi_vfork`
     dg_bind = 88,
     dg_connect = 89,
+    dg_sysmisc = 90, // DG multiplexed misc query (r2=selector); hostid uses it
     dg_gethostname = 91, // used by hostname(1); no standalone libc stub
     dg_getsockname = 93,
     dg_recvfrom = 97,
