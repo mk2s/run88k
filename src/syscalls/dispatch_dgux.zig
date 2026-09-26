@@ -225,6 +225,7 @@ fn dispatchStd(runner: *machine.Runner) bool {
         .bcs_sysconf => return sysSysconf(runner),
         .bcs_time => return sysTime(runner),
         .times => return sysTimes(runner),
+        .ulimit => return sysUlimit(runner),
         .getcwd => return sysGetcwd(runner),
         .sync => {
             dgux.returnSuccess(cpu, 0); // no-op: host fs is coherent
@@ -1199,6 +1200,25 @@ fn sysTime(runner: *machine.Runner) bool {
 // assembler/compiler phases call this for timing; exact values don't matter,
 // only that it succeeds and advances. Report a small increasing tick count.
 var times_tick: u32 = 1;
+
+// ulimit(cmd, newlimit): SVR4 resource limits.
+//   1 UL_GFILLIM  get file-size limit (512-byte blocks)
+//   2 UL_SFILLIM  set file-size limit
+//   3 UL_GMEMLIM  get max break address (data-size ceiling)
+//   4 UL_GDESLIM  get max file descriptors
+// Tools like sort query these at startup to size buffers.
+fn sysUlimit(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const cmd = dgux.arg(cpu, 0);
+    switch (cmd) {
+        1 => dgux.returnSuccess(cpu, 0x0020_0000), // large file limit (blocks)
+        2 => dgux.returnSuccess(cpu, dgux.arg(cpu, 1)), // accept the set, echo it
+        3 => dgux.returnSuccess(cpu, 0x0800_0000), // max break (below mmap region)
+        4 => dgux.returnSuccess(cpu, fsmod.MAX_FD), // max fds
+        else => dgux.returnError(cpu, EINVAL),
+    }
+    return true;
+}
 
 fn sysTimes(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
