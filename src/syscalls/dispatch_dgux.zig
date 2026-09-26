@@ -247,6 +247,7 @@ fn dispatchStd(runner: *machine.Runner) bool {
         // their real phases.
         .fork => return sysFork(runner),
         .execve => return sysExec(runner),
+        .pipe => return sysPipe(runner),
 
         // Identity syscalls: report plausible values (running as root). The
         // dual-return calls hand the second value back in r3.
@@ -1367,6 +1368,23 @@ fn readStrVec(runner: *machine.Runner, vec_ptr: u32, out: [][]const u8, bufs: an
         n += 1;
     }
     return n;
+}
+
+/// pipe (std gate 34). Dual-return: the kernel returns the read fd in r2 and
+/// the write fd in r3; the libc stub stores them into the caller's fildes[2].
+/// So we set r2:r3 and do NOT write the array (like waitpid/getpid).
+fn sysPipe(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    const pm = pmOf(runner) orelse {
+        dgux.returnError(cpu, EINVAL);
+        return true;
+    };
+    const fds = pm.doPipe() catch {
+        dgux.returnError(cpu, ENOMEM);
+        return true;
+    };
+    dgux.returnSuccess2(cpu, fds[0], fds[1]); // r2=read, r3=write
+    return true;
 }
 
 fn sysExec(runner: *machine.Runner) bool {

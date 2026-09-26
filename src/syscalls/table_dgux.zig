@@ -53,6 +53,7 @@ pub const Std = enum(u32) {
     nice = 31,
     bcs_open = 32,
     pathconf = 33,
+    pipe = 34, // dual-return: read fd in r2, write fd in r3 (stub stores both)
     poll = 36,
     profil = 37,
     ptrace = 38,
