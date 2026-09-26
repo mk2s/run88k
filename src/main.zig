@@ -235,6 +235,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     if (fs) |*f| {
         pm = procmodel.HostProcess.init(&runner, f, io, gpa);
         pm.?.openbsd = (os == .openbsd);
+        pm.?.dgux = (os == .dgux);
         runner.procmodel = &pm.?;
     }
 

@@ -680,9 +680,36 @@ fn sysDup(runner: *machine.Runner) bool {
 /// F_SETFL=4. Minimal: report success/benign values so libc startup proceeds.
 fn sysFcntl(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
+    const gfd = dgux.arg(cpu, 0);
     const cmd = dgux.arg(cpu, 1);
+    const arg3 = dgux.arg(cpu, 2);
     switch (cmd) {
-        0 => return sysDup(runner), // F_DUPFD (approx: ignores the min-fd arg)
+        0 => { // F_DUPFD: duplicate gfd onto the lowest free fd >= arg3.
+            // sh relies on this to move an opened script fd up to a high fd
+            // (out of the way of 0/1/2) before reading it; ignoring the min-fd
+            // arg (as a plain dup does) hands back a low fd and sh then reads
+            // the wrong descriptor.
+            const fd = hostFd(runner, gfd) orelse {
+                dgux.returnError(cpu, EBADF);
+                return true;
+            };
+            const hnew = dup(fd);
+            if (hnew < 0) {
+                dgux.returnError(cpu, mapErrno(hostErrno()));
+                return true;
+            }
+            if (fsOf(runner)) |fs| {
+                const gnew = fs.allocFdFrom(hnew, arg3) orelse {
+                    _ = close(hnew);
+                    dgux.returnError(cpu, EBADF);
+                    return true;
+                };
+                dgux.returnSuccess(cpu, gnew);
+            } else {
+                dgux.returnSuccess(cpu, @intCast(hnew));
+            }
+            return true;
+        },
         1, 3 => {
             dgux.returnSuccess(cpu, 0); // F_GETFD/F_GETFL -> 0
             return true;

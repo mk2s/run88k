@@ -61,6 +61,10 @@ pub const HostProcess = struct {
     /// exec loads via the COFF loader and uses the UTek register-handoff
     /// startup (setupUtek) instead of the ELF path.
     utek: bool = false,
+    /// True when running a DG/UX guest: ELF executables (static + dynamic
+    /// self-linked, same as SysV/88), but a script with no `#!` is run via
+    /// `/sbin/sh` (DG/UX's shell), and dynamic children self-link.
+    dgux: bool = false,
     /// A small ring of already-reaped children awaiting a guest wait4.
     ///
     /// SIGCHLD delivery peeks for a reapable child before jumping to the
@@ -234,12 +238,12 @@ pub const HostProcess = struct {
             return;
         }
 
-        // Shell fallback: a UTek executable that is neither COFF nor ELF and
-        // has no `#!` line is a shell script (many UTek utilities — basename,
-        // dirname, true, false — start with a `#ident` comment, no shebang).
-        // The kernel/exec convention runs such a file via /bin/sh. Re-exec as
-        // `/bin/sh <script> <orig args...>`.
-        if (self.utek and !coff.detect(image) and !isElf(image)) {
+        // Shell fallback: a UTek/DG-UX executable that is neither COFF nor ELF
+        // and has no `#!` line is a shell script (many system utilities —
+        // basename, dirname, true, false — start with a `#ident` comment, no
+        // shebang). The kernel/exec convention runs such a file via the shell.
+        // Re-exec as `<sh> <script> <orig args...>`.
+        if ((self.utek or self.dgux) and !coff.detect(image) and !isElf(image)) {
             if (depth >= max_shebang_depth) return error.ExecFailed;
             return self.execShellScript(path, argv, envp, depth);
         }
@@ -325,9 +329,11 @@ pub const HostProcess = struct {
         @memcpy(script_buf[0..script_path.len], script_path);
         const script_s = script_buf[0..script_path.len];
 
+        // DG/UX's /bin/sh is a symlink to /sbin/sh; use the real path directly.
+        const sh: []const u8 = if (self.dgux) "/sbin/sh" else "/bin/sh";
         var new_argv: [128][]const u8 = undefined;
         var n: usize = 0;
-        new_argv[n] = "/bin/sh";
+        new_argv[n] = sh;
         n += 1;
         new_argv[n] = script_s;
         n += 1;
@@ -336,7 +342,7 @@ pub const HostProcess = struct {
             new_argv[n] = argv[i];
             n += 1;
         }
-        return self.doExecDepth("/bin/sh", new_argv[0..n], envp, depth + 1);
+        return self.doExecDepth(sh, new_argv[0..n], envp, depth + 1);
     }
 
     /// Handle a `#!interpreter [arg]` script: parse the first line, then re-exec
