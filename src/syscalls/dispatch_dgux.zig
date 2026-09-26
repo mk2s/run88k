@@ -238,6 +238,7 @@ fn dispatchStd(runner: *machine.Runner) bool {
         .chmod => return sysChmod(runner),
         .unlink => return sysUnlink(runner),
         .rename => return sysRename(runner),
+        .link => return sysLink(runner),
         .mkdir => return sysMkdir(runner),
         .rmdir => return sysRmdir(runner),
         .getdents => return sysGetdents(runner),
@@ -334,6 +335,7 @@ fn dispatchExt(runner: *machine.Runner) bool {
             dgux.returnSuccess(cpu, 1); // process group / session id = 1
             return true;
         },
+        .dg_188 => return sysDg188(runner),
         .setpgrp, .fchdir => {
             dgux.returnSuccess(cpu, 0);
             return true;
@@ -469,6 +471,18 @@ fn sysUnlink(runner: *machine.Runner) bool {
     var hbuf: [2048]u8 = undefined;
     const cpath = resolveArgPath(runner, 0, &gbuf, &hbuf) orelse return true;
     if (fsmod.c.unlink(cpath) < 0) dgux.returnError(cpu, mapErrno(hostErrno())) else dgux.returnSuccess(cpu, 0);
+    return true;
+}
+
+fn sysLink(runner: *machine.Runner) bool {
+    const cpu = &runner.cpu;
+    var gbuf1: [1024]u8 = undefined;
+    var hbuf1: [2048]u8 = undefined;
+    var gbuf2: [1024]u8 = undefined;
+    var hbuf2: [2048]u8 = undefined;
+    const oldp = resolveArgPath(runner, 0, &gbuf1, &hbuf1) orelse return true;
+    const newp = resolveArgPath(runner, 1, &gbuf2, &hbuf2) orelse return true;
+    if (fsmod.c.link(oldp, newp) < 0) dgux.returnError(cpu, mapErrno(hostErrno())) else dgux.returnSuccess(cpu, 0);
     return true;
 }
 
@@ -807,6 +821,15 @@ fn sysFstat(runner: *machine.Runner) bool {
     runner.memory.enforce = was;
     dgux.returnSuccess(cpu, 0);
     return true;
+}
+
+/// dg_188(path, statbuf, flag) — a DG-native stat-family call cof2elf/cp use
+/// to fetch (dev, ino) when deciding whether two paths are the same file. It
+/// must return a DISTINCT inode per real file and FAIL (ENOENT) for a path
+/// that does not exist yet (the fresh temp), or cp reports "identical files".
+/// We service it exactly like stat(2): resolve, host-stat, fill struct stat.
+fn sysDg188(runner: *machine.Runner) bool {
+    return sysStat(runner);
 }
 
 fn sysStat(runner: *machine.Runner) bool {

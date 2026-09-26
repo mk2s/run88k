@@ -136,6 +136,7 @@ pub const Ext = enum(u32) {
     sigignore = 162,
     sigpause = 163,
     getpgid = 182,
+    dg_188 = 188, // unidentified DG-native call used by cof2elf temp-file logic
     fchdir = 204,
     statvfs = 206,
     fstatvfs = 207,
