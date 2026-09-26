@@ -546,15 +546,79 @@ pub const Linker = struct {
             if (self.preemptOf(name[0..nlen]) != null) continue;
             // Only synthesize when a LIBRARY also defines this symbol (so there
             // is a divergent copy to unify). Copy the library's initial bytes.
-            const src = self.lookupDefiningOther(name[0..nlen], exe) orelse continue;
+            // Try the dynamic symbol tables first, then the retained host
+            // .symtab of each library: some libc globals (e.g. the timezone
+            // trio `timezone`/`altzone`/`daylight`, and `tzname`) are WEAK and
+            // are NOT exported in libc's .dynsym — they live only in .symtab.
+            // A dynsym-only search misses them, so libc's tzset() writes its
+            // own copies while the exe reads its (uninitialized) copies.
+            const src = self.lookupDefiningOther(name[0..nlen], exe) orelse
+                self.hostSymOther(name[0..nlen], exe) orelse continue;
             const n = @min(exe_size, self.memory.read32(sym + 8));
             var k: u32 = 0;
             while (k < n) : (k += 1) {
                 self.memory.write8(exe_addr + k, self.memory.read8(src + k));
             }
+            // A real COPY reloc copies the library's RELOCATED image. This
+            // synth pass runs before the library's own RELATIVE relocs (pass 2),
+            // so any pointer WORD inside [src, src+n) that the library will
+            // bias-fix is still stored unrelocated. Apply that same bias to the
+            // exe copy now, so e.g. libc's `tzname[0]` (a RELATIVE-relocated
+            // pointer to the internal `baseTZ` buffer) lands biased in the exe
+            // copy instead of as a raw unbiased address that later faults.
+            self.biasCopiedPointers(src, exe_addr, n);
             self.addPreempt(name[0..nlen], exe_addr);
             if (DBG) dbg("synth-copy-preempt '{s}' exe={x} <- lib={x} size={x}", .{ name[0..nlen], exe_addr, src, n });
         }
+    }
+
+    /// After synth-copying a library symbol's bytes into the exe copy, fix up
+    /// pointer words the library would RELATIVE-relocate. `src` is the biased
+    /// library address the bytes came from; `dst` is the exe copy; `n` bytes.
+    /// For each BBASED_32 reloc in the defining library whose (biased) target
+    /// lands in [src, src+n), add the library bias to the matching word in dst.
+    fn biasCopiedPointers(self: *Linker, src: u32, dst: u32, n: u32) void {
+        // Identify the defining library by bias range.
+        var owner: ?*Object = null;
+        var oi: usize = 1;
+        while (oi < self.n_objs) : (oi += 1) {
+            const o = &self.objs[oi];
+            if (src >= o.bias and src < o.bias +% LIB_STRIDE) {
+                owner = o;
+                break;
+            }
+        }
+        const obj = owner orelse return;
+        if (obj.rela == 0 or obj.relasz == 0) return;
+        const lo = src;
+        const hi = src +% n;
+        var off: u32 = 0;
+        while (off < obj.relasz) : (off += 12) {
+            const r_info = self.memory.read32(obj.rela + off + 4);
+            if ((r_info & 0xff) != R_88K_BBASED_32) continue;
+            const slot = self.memory.read32(obj.rela + off + 0) +% obj.bias;
+            if (slot < lo or slot >= hi) continue;
+            // This word of the copied region is a bias-relative pointer. The
+            // exe copy currently holds the unrelocated value; add the bias.
+            const word_off = slot -% lo;
+            const cur = self.memory.read32(dst +% word_off);
+            self.memory.write32(dst +% word_off, cur +% obj.bias);
+            if (DBG) dbg("  bias-copied ptr dst+{x}: {x} -> {x}", .{ word_off, cur, cur +% obj.bias });
+        }
+    }
+
+    /// Find `name` in the retained host .symtab of any library (not `exclude`),
+    /// returning its biased address. Complements lookupDefiningOther for
+    /// symbols that are defined but NOT exported in a library's .dynsym (e.g.
+    /// libc's WEAK timezone globals `timezone`/`altzone`/`daylight`).
+    fn hostSymOther(self: *Linker, name: []const u8, exclude: *const Object) ?u32 {
+        var oi: usize = 0;
+        while (oi < self.n_objs) : (oi += 1) {
+            const obj = &self.objs[oi];
+            if (obj == exclude) continue;
+            if (self.hostSymByName(obj, name)) |s| return s.addr;
+        }
+        return null;
     }
 
     /// Like lookup, but excludes `exclude` (used for COPY relocs: the value
