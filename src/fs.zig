@@ -41,6 +41,42 @@ extern fn r88k_dirclose(handle: c_int) void;
 pub const MAX_FD: usize = 64;
 const MAX_SYMLINK_DEPTH: u32 = 16;
 
+/// Expand a DG/UX `elink:` template into a concrete path, writing into `out`
+/// and returning the slice. Each `${VAR:-default}` reference expands to its
+/// default (we don't carry the SDE env vars, so the defaults — SDE_PATH=/usr,
+/// TARGET_BINARY_INTERFACE=m88kdgux — are exactly what a stock toolchain uses).
+/// A bare `${VAR}` with no default expands to empty. Non-reference text is
+/// copied verbatim. Overflow truncates safely.
+fn expandElink(template: []const u8, out: []u8) []const u8 {
+    var o: usize = 0;
+    var i: usize = 0;
+    while (i < template.len and o < out.len) {
+        if (template[i] == '$' and i + 1 < template.len and template[i + 1] == '{') {
+            // Find the matching '}'.
+            const close = std.mem.indexOfScalarPos(u8, template, i + 2, '}') orelse {
+                out[o] = template[i];
+                o += 1;
+                i += 1;
+                continue;
+            };
+            const inner = template[i + 2 .. close]; // e.g. "VAR:-default" or "VAR"
+            const dflt: []const u8 = if (std.mem.indexOf(u8, inner, ":-")) |sep|
+                inner[sep + 2 ..]
+            else
+                ""; // ${VAR} with no default -> empty
+            const take = @min(dflt.len, out.len - o);
+            @memcpy(out[o .. o + take], dflt[0..take]);
+            o += take;
+            i = close + 1;
+        } else {
+            out[o] = template[i];
+            o += 1;
+            i += 1;
+        }
+    }
+    return out[0..o];
+}
+
 pub const Mount = struct {
     /// Guest path prefix, e.g. "/" or "/usr". No trailing slash except "/".
     guest_prefix: []const u8,
@@ -254,7 +290,19 @@ pub const Fs = struct {
                 var linkbuf: [1024]u8 = undefined;
                 const n = c.readlink(host.ptr, &linkbuf, linkbuf.len);
                 if (n <= 0) continue; // not a symlink: keep walking
-                const target = linkbuf[0..@intCast(n)];
+                var target: []const u8 = linkbuf[0..@intCast(n)];
+
+                // DG/UX "environment link": the target is a literal string
+                // `elink:<template>` where <template> contains `${VAR:-default}`
+                // references resolved at link-follow time (used to point the
+                // toolchain's /usr/lib/{crt0.o,libc.a,...} at the active SDE
+                // target, e.g. /usr/sde/m88kdgux/usr/lib/...). We don't carry
+                // those env vars, so expand each `${VAR:-default}` to its
+                // default. The expanded path is guest-absolute.
+                var elink_buf: [2048]u8 = undefined;
+                if (std.mem.startsWith(u8, target, "elink:")) {
+                    target = expandElink(target["elink:".len..], &elink_buf);
+                }
 
                 // Build the new guest-absolute path: (symlink target, resolved)
                 // followed by the remaining unprocessed components.

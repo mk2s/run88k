@@ -238,6 +238,26 @@ pub const HostProcess = struct {
             return;
         }
 
+        // DG/UX GCC toolchain: the gcc/cpp/cc1 phases are static m88k COFF
+        // (magic 0x0161), not ELF. Load via the COFF loader and use the SysV
+        // register-handoff startup (r2=argc, r3=argv, r4=envp), same as the
+        // static-ELF DG/UX path.
+        if (self.dgux and coff.detect(image)) {
+            const memory = self.runner.memory;
+            memory.clearRegions();
+            memory.enforce = false;
+            @memset(memory.bytes, 0);
+            const cimg = coff.load(memory, image) catch return error.ExecFailed;
+            self.runner.brk = cimg.brk;
+            self.runner.brk_base = cimg.brk;
+            self.runner.mmap_next = 0x0800_0000;
+            process.setup(self.runner, cimg.entry, cimg.brk, argv, envp) catch return error.ExecFailed;
+            memory.enforce = true;
+            self.new_brk = cimg.brk;
+            self.exec_entry = cimg.entry;
+            return;
+        }
+
         // Shell fallback: a UTek/DG-UX executable that is neither COFF nor ELF
         // and has no `#!` line is a shell script (many system utilities —
         // basename, dirname, true, false — start with a `#ident` comment, no

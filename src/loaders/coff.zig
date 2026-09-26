@@ -63,8 +63,15 @@ pub const LoadedImage = struct {
     load_high: u32,
 };
 
-pub const F_MAGIC_M88K: u16 = 0x016d;
+pub const F_MAGIC_M88K: u16 = 0x016d; // "88K BCS" (UTek, SDE as/ld output)
+pub const F_MAGIC_M88K_GCC: u16 = 0x0161; // older AT&T m88k COFF (DG/UX GCC 2.x
+// toolchain: gcc/gcc-cpp/gcc-cc1). Same 44-byte scnhdr / a.out-header layout.
 pub const AOUT_MAGIC: u16 = 0x010b;
+
+/// True if `magic` is one of the m88k COFF file magics we load.
+fn isM88kCoffMagic(magic: u16) bool {
+    return magic == F_MAGIC_M88K or magic == F_MAGIC_M88K_GCC;
+}
 const FILHDR_SIZE: usize = 20;
 const SCNHDR_STRIDE: usize = 44;
 
@@ -79,13 +86,13 @@ fn rd32(b: []const u8, off: usize) u32 {
 /// the auto-detect hook used to select the UTek personality when the CLI
 /// didn't force one.
 pub fn detect(image: []const u8) bool {
-    return image.len >= 2 and rd16(image, 0) == F_MAGIC_M88K;
+    return image.len >= 2 and isM88kCoffMagic(rd16(image, 0));
 }
 
 /// Validate the file header for an m88k BCS COFF executable.
 pub fn checkHeader(image: []const u8) Error!void {
     if (image.len < FILHDR_SIZE) return error.NotCoff;
-    if (rd16(image, 0) != F_MAGIC_M88K) return error.NotM88k;
+    if (!isM88kCoffMagic(rd16(image, 0))) return error.NotM88k;
 }
 
 /// Load `image` (raw file bytes) into `memory`. Permission enforcement is

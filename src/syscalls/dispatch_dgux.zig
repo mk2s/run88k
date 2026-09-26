@@ -359,8 +359,9 @@ fn dispatchExt(runner: *machine.Runner) bool {
             return true;
         },
 
-        // Signal syscalls: accept, return benign success.
-        .dg_sigaction, .dg_sigblock, .dg_sigsetmask, .sighold, .sigrelse, .sigignore => {
+        // Signal syscalls: accept, return benign success. dg_signal (like
+        // signal(2)) returns the previous handler; 0 (SIG_DFL) is fine.
+        .dg_sigaction, .dg_sigblock, .dg_sigsetmask, .sighold, .sigrelse, .sigignore, .dg_signal, .sigpause => {
             dgux.returnSuccess(cpu, 0);
             return true;
         },
@@ -1233,6 +1234,10 @@ fn sysDgIoctl(runner: *machine.Runner) bool {
 fn sysSysconf(runner: *machine.Runner) bool {
     const cpu = &runner.cpu;
     const name = dgux.arg(cpu, 0);
+    // Values from usr/include/sys/_int_unistd.h. Return plausible parameters;
+    // the GCC toolchain queries several of these at startup (notably
+    // _SC_MEMCTL_UNIT=30 and _SC_PAGESIZE=36) and dereferences derived sizes,
+    // so an unknown -1 return leads to a null/oversized pointer fault.
     const val: ?u32 = switch (name) {
         1 => 0x10000, // _SC_ARG_MAX
         2 => 64, // _SC_CHILD_MAX
@@ -1242,6 +1247,32 @@ fn sysSysconf(runner: *machine.Runner) bool {
         6 => 1, // _SC_JOB_CONTROL
         7 => 1, // _SC_SAVED_IDS
         8 => 199009, // _SC_VERSION (POSIX.1 stamp)
+        9 => 1, // _SC_BCS_VERSION
+        10 => 0, // _SC_BCS_VENDOR_STAMP
+        11 => 0, // _SC_BCS_SYS_ID
+        12 => 0x8000, // _SC_MAXUMEMV (1-KB pages)
+        13 => 64, // _SC_MAXUPROC
+        14 => 8192, // _SC_MAXMSGSZ
+        15 => 128, // _SC_NMSGHDRS
+        16 => 0x100000, // _SC_SHMMAXSZ
+        17 => 1, // _SC_SHMMINSZ
+        18 => 128, // _SC_SHMSEGS
+        19 => 60, // _SC_NMSYSSEM
+        20 => 0x7fff, // _SC_MAXSEMVL
+        27 => 0x10000, // _SC_PHYSMEM (kb)
+        28 => 0x8000, // _SC_AVAILMEM (kb)
+        29 => 1, // _SC_NICE
+        30 => 0x1000, // _SC_MEMCTL_UNIT (page/alloc granularity)
+        31 => 0x1000, // _SC_SHMLBA
+        32 => 1, // _SC_SVSTREAMS
+        33 => 0x1a, // _SC_CPUID (CPU mask level; must be >= 13)
+        34 => 1, // _SC_BSDNETWORK
+        35 => 32, // _SC_NPTYS
+        36 => 0x1000, // _SC_PAGESIZE
+        37 => 3, // _SC_XOPEN_VERSION
+        40 => 1, // _SC_RWX_SUPPORT
+        0x10200 => 0x800, // _SC_STREAM_MAX
+        0x10201 => 255, // _SC_TZNAME_MAX
         else => null,
     };
     if (val) |v| dgux.returnSuccess(cpu, v) else dgux.returnError(cpu, EINVAL);
