@@ -338,6 +338,73 @@ pub fn setupOpenbsd(
     runner.setPc(entry);
 }
 
+/// NetBSD/luna88k process setup. NetBSD's `_start`/`__start` reads
+/// argc/argv/envp off the STACK, but (unlike OpenBSD, which reads argc from
+/// *r31) the kernel passes a POINTER to the argc block in **r2** — `__start`
+/// does `argc = *r2; argv = r2 + 4` (verified via Ghidra, docs/abi-netbsd.md).
+/// So we build the classic argc/argv/envp stack image and set BOTH r31 (SP)
+/// and r2 to point at argc. No ELF aux vector is needed for a static binary.
+/// The halt pad uses the NetBSD exit stub (vector 128, number in r13).
+pub fn setupNetbsd(
+    runner: *machine.Runner,
+    entry: u32,
+    brk: u32,
+    argv: []const []const u8,
+    envp: []const []const u8,
+) StartError!void {
+    const memory = runner.memory;
+
+    memory.addRegion(stack_top - stack_size, stack_size, .{ .read = true, .write = true }) catch return error.OutOfStack;
+    // Pad holds the exit stub (@halt_pad) and the signal-return trampoline
+    // (@halt_pad+16); map 32 bytes r-x.
+    memory.addRegion(halt_pad, 32, .{ .read = true, .exec = true }) catch return error.OutOfStack;
+
+    // Pre-map an initial heap [brk, brk+initial_heap) as RW, zero-filled.
+    {
+        const w = memory.enforce;
+        memory.enforce = false;
+        memory.zero(brk, initial_heap);
+        memory.enforce = w;
+    }
+    memory.addRegion(brk, initial_heap, .{ .read = true, .write = true }) catch return error.OutOfStack;
+    runner.brk = brk + initial_heap;
+    runner.brk_base = brk;
+
+    {
+        const w = memory.enforce;
+        memory.enforce = false;
+        // Halt pad @halt_pad: NetBSD SYS_exit stub (`or r13,r0,1; tb0 0,r0,128`)
+        // so a stray `jmp r1` out of _start terminates cleanly.
+        memory.write32(halt_pad + 0, (@as(u32, 0x16) << 26) | (@as(u32, 13) << 21) | 1); // or r13,r0,1
+        memory.write32(halt_pad + 4, 0xf000_d080); // tb0 0,r0,128
+        // Signal-return trampoline @halt_pad+16: `or r2,r0,r31` (scp = sp) then
+        // `sigreturn` (r13=295 = SYS___sigreturn14; tb0 0,r0,128).
+        memory.write32(halt_pad + 16, 0xf440_581f); // or r2, r0, r31
+        memory.write32(halt_pad + 20, (@as(u32, 0x16) << 26) | (@as(u32, 13) << 21) | 295); // or r13,r0,295
+        memory.write32(halt_pad + 24, 0xf000_d080); // tb0 0,r0,128
+        memory.enforce = w;
+    }
+    runner.sig_tramp = halt_pad + 16;
+
+    const layout = try buildStack(memory, argv, envp);
+
+    // A real exec(2) hands the new program a CLEAN register file.
+    var ri: u5 = 0;
+    while (true) {
+        runner.setReg(ri, 0);
+        if (ri == 31) break;
+        ri += 1;
+    }
+    runner.cpu.branch_pending = false;
+
+    // r2 = pointer to the argc block (NetBSD __start reads argc = *r2), and
+    // r31 = SP points at the same block.
+    runner.setReg(2, layout.sp); // r2 = &argc
+    runner.setReg(machine.Reg.sp, layout.sp); // r31 = SP (points at argc)
+    runner.setReg(machine.Reg.link, halt_pad); // r1 = return address -> halt pad
+    runner.setPc(entry);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

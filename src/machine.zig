@@ -136,9 +136,12 @@ pub const Runner = struct {
 
     pub const NO_TRAP: u32 = 0xffff_ffff;
 
-    /// Default instruction budget for a single run() call. Generous; exists
-    /// only to stop a truly wedged guest.
-    pub const default_max_steps: u64 = 200_000_000;
+    /// Default instruction budget for a single run() call. Generous: a heavy
+    /// `-O2` compile of a large source (e.g. the NetBSD kernel's igmp.c) can
+    /// legitimately run into the billions of emulated instructions. The budget
+    /// exists only to stop a truly wedged guest, so keep it high; override with
+    /// `--max-steps N` (0 = unlimited) for exceptional workloads.
+    pub var default_max_steps: u64 = 20_000_000_000;
 
     pub fn init(memory: *mem.Memory) Runner {
         return .{ .memory = memory };
@@ -180,8 +183,10 @@ pub const Runner = struct {
             return .fault;
         }
 
+        // max_steps == 0 means "unlimited" (never time out).
+        const unlimited = max_steps == 0;
         var budget = max_steps;
-        while (budget > 0) : (budget -= 1) {
+        while (unlimited or budget > 0) : (budget -%= 1) {
             self.pc_ring[self.pc_ring_i % self.pc_ring.len] = self.cpu.pc;
             self.pc_ring_i +%= 1;
             if (trace_all) {

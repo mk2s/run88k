@@ -65,6 +65,10 @@ pub const HostProcess = struct {
     /// self-linked, same as SysV/88), but a script with no `#!` is run via
     /// `/sbin/sh` (DG/UX's shell), and dynamic children self-link.
     dgux: bool = false,
+    /// True when running a NetBSD guest: static ELF executables using the
+    /// NetBSD register+stack startup (r2 = &argc), same trap mechanism as
+    /// OpenBSD but vector 128. Dynamic children are not yet supported.
+    netbsd: bool = false,
     /// A small ring of already-reaped children awaiting a guest wait4.
     ///
     /// SIGCHLD delivery peeks for a reapable child before jumping to the
@@ -315,6 +319,17 @@ pub const HostProcess = struct {
             memory.enforce = true;
             self.new_brk = img.brk;
             self.exec_entry = start_pc;
+            return;
+        }
+
+        if (self.netbsd) {
+            // NetBSD: static ELF only (dynamic children unsupported for now).
+            // r2 = &argc register+stack startup.
+            if (img.is_dynamic) return error.ExecFailed;
+            process.setupNetbsd(self.runner, img.entry, img.brk, argv, envp) catch return error.ExecFailed;
+            memory.enforce = true;
+            self.new_brk = img.brk;
+            self.exec_entry = img.entry;
             return;
         }
 

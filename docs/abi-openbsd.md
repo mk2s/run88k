@@ -257,6 +257,21 @@ library's ELF header via `lseek`+`read`, and a swapped-word seek landed on a
 sparse hole), plus implementing `chmod`/`fchmod` so the driver can mark its
 output executable.
 
+## LATENT BUG (not yet fixed): lseek 64-bit RETURN word order
+`sysLseek` (dispatch_openbsd.zig) returns the position via
+`returnSuccess2(lo, hi)`, which sets **r2=lo, r3=hi**. Per the ABI above, a
+64-bit value in a register pair is **high word first**, so the kernel should
+return **r2=hi, r3=lo**. This is the exact bug that broke the NetBSD static
+`ld`/`nm` on `libc.a` ("File truncated"): libc/BFD reads the low word as the
+HIGH half of its 64-bit file position, so every subsequent seek targets
+`pos<<32`. OpenBSD hasn't hit it because it links **dynamically** (libc.so via
+ld.so) and never runs BFD's large-static-archive member-seek path that reads a
+64-bit lseek position back. Fix is `returnSuccess2(hi, lo)` (as done in
+`dispatch_netbsd.zig`), but should be applied + regression-tested with the
+OpenBSD root (`/mnt/hd6`) mounted first, to confirm no OpenBSD path relies on the
+current (backwards) behavior. Same latent bug likely exists in the SysV/88 and
+DG/UX dispatchers — audit their lseek return order too.
+
 ## Known gaps / next
 - **SysV/88 `cc`** faults (`kind=unmapped addr=0` in the driver, ~pc 0x5034164)
   on both `-c` and `-o`. This is a **pre-existing** SysV/88 issue (reproduces

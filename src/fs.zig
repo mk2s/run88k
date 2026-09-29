@@ -18,6 +18,11 @@
 
 const std = @import("std");
 
+extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+fn dbgw(s: []const u8) isize {
+    return write(2, s.ptr, s.len);
+}
+
 pub const c = struct {
     pub extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
     pub extern "c" fn close(fd: c_int) c_int;
@@ -28,9 +33,13 @@ pub const c = struct {
     pub extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
     pub extern "c" fn rmdir(path: [*:0]const u8) c_int;
     pub extern "c" fn link(oldp: [*:0]const u8, newp: [*:0]const u8) c_int;
+    pub extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
     pub extern "c" fn ftruncate(fd: c_int, len: c_long) c_int;
     pub extern "c" fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
     pub extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
+    pub extern "c" fn chown(path: [*:0]const u8, owner: c_uint, group: c_uint) c_int;
+    pub extern "c" fn fchown(fd: c_int, owner: c_uint, group: c_uint) c_int;
+    pub extern "c" fn lchown(path: [*:0]const u8, owner: c_uint, group: c_uint) c_int;
 };
 
 // Directory-stream shim (src/host_dir.c).
@@ -141,6 +150,47 @@ pub const Fs = struct {
     /// Register a mount. Later resolve() picks the longest matching guest prefix.
     pub fn addMount(self: *Fs, guest_prefix: []const u8, host_root: []const u8) !void {
         try self.mounts.append(self.allocator, .{ .guest_prefix = guest_prefix, .host_root = host_root });
+    }
+
+    /// Reverse-map a HOST path to its guest-absolute path via the mount table
+    /// (longest matching `host_root` prefix). Used to turn the run target's
+    /// host path (e.g. /mnt/netbsd/usr/bin/cc) into the guest argv[0] the
+    /// program expects (/usr/bin/cc) — critical for GCC, which derives its
+    /// tool-search exec prefix from argv[0]. Returns null if no mount contains
+    /// the path. Writes into `out`.
+    pub fn hostToGuest(self: *const Fs, host_path: []const u8, out: []u8) ?[]const u8 {
+        var best: ?Mount = null;
+        for (self.mounts.items) |m| {
+            const hr = m.host_root;
+            // Match if host_path == host_root or host_path starts with host_root + '/'.
+            const matches = std.mem.eql(u8, host_path, hr) or
+                (host_path.len > hr.len and std.mem.startsWith(u8, host_path, hr) and host_path[hr.len] == '/');
+            if (!matches) continue;
+            if (best == null or hr.len > best.?.host_root.len) best = m;
+        }
+        const m = best orelse return null;
+        const rest = host_path[m.host_root.len..]; // includes leading '/' or empty
+        const gp = m.guest_prefix;
+        var o: usize = 0;
+        // Guest prefix (drop a trailing "/" so we don't double it).
+        const gp_trim = if (gp.len > 1 and gp[gp.len - 1] == '/') gp[0 .. gp.len - 1] else gp;
+        if (!(gp_trim.len == 1 and gp_trim[0] == '/')) {
+            if (o + gp_trim.len > out.len) return null;
+            @memcpy(out[o..][0..gp_trim.len], gp_trim);
+            o += gp_trim.len;
+        }
+        if (rest.len == 0) {
+            if (o == 0) {
+                if (out.len < 1) return null;
+                out[0] = '/';
+                o = 1;
+            }
+        } else {
+            if (o + rest.len > out.len) return null;
+            @memcpy(out[o..][0..rest.len], rest);
+            o += rest.len;
+        }
+        return out[0..o];
     }
 
     fn cwdSlice(self: *const Fs) []const u8 {

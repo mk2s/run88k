@@ -24,6 +24,8 @@ const dispatch = @import("syscalls/dispatch.zig");
 const dispatch_openbsd = @import("syscalls/dispatch_openbsd.zig");
 const dispatch_utek = @import("syscalls/dispatch_utek.zig");
 const dispatch_dgux = @import("syscalls/dispatch_dgux.zig");
+const dispatch_netbsd = @import("syscalls/dispatch_netbsd.zig");
+const nbsd = @import("abi/netbsd.zig");
 const difftrace = @import("difftrace.zig");
 const fsmod = @import("fs.zig");
 const dynamic = @import("loaders/dynamic.zig");
@@ -59,11 +61,17 @@ pub fn main(init: std.process.Init) !void {
             dispatch_openbsd.trace = true;
             dispatch_utek.trace = true;
             dispatch_dgux.trace = true;
+            dispatch_netbsd.trace = true;
         } else if (std.mem.eql(u8, args[i], "--trace-all")) {
             // Per-instruction PC/register trace to stderr (deep core debugging).
             machine.trace_all = true;
         } else if (std.mem.eql(u8, args[i], "--watch") and i + 1 < args.len) {
             machine.watch_addr = std.fmt.parseInt(u32, args[i + 1], 16) catch 0;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--max-steps") and i + 1 < args.len) {
+            // Per-process instruction budget (0 = unlimited). A heavy -O2
+            // compile can need billions of emulated instructions.
+            machine.Runner.default_max_steps = std.fmt.parseInt(u64, args[i + 1], 10) catch machine.Runner.default_max_steps;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--os") and i + 1 < args.len) {
             if (std.mem.eql(u8, args[i + 1], "openbsd")) {
@@ -74,8 +82,10 @@ pub fn main(init: std.process.Init) !void {
                 os_choice = .utek;
             } else if (std.mem.eql(u8, args[i + 1], "dgux")) {
                 os_choice = .dgux;
+            } else if (std.mem.eql(u8, args[i + 1], "netbsd")) {
+                os_choice = .netbsd;
             } else {
-                outf("run88k: unknown --os '{s}' (use sysv88, openbsd, utek or dgux)\n", .{args[i + 1]});
+                outf("run88k: unknown --os '{s}' (use sysv88, openbsd, netbsd, utek or dgux)\n", .{args[i + 1]});
                 return;
             }
             i += 1;
@@ -146,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Guest OS personality.
-const Os = enum { sysv88, openbsd, utek, dgux };
+const Os = enum { sysv88, openbsd, netbsd, utek, dgux };
 
 /// Load base for the OpenBSD interpreter (/usr/libexec/ld.so). Chosen above the
 /// exec + heap and below the mmap bump region (0x08000000) and stack
@@ -181,11 +191,32 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     }
     defer if (fs) |*f| f.deinit();
 
+    // Rewrite argv[0] to the GUEST path. The run target is given as a host
+    // path (e.g. /mnt/netbsd/usr/bin/cc) so we can read it, but the guest
+    // program must see its own guest-absolute argv[0] (/usr/bin/cc). GCC in
+    // particular derives its tool-search "exec prefix" from argv[0]; leaving
+    // the host prefix there makes cc look for cc1 under /mnt/netbsd/usr/bin and
+    // never find /usr/libexec/cc1. Reverse-map through the mount table.
+    var argv_buf: [256][]const u8 = undefined;
+    var argv_g: []const []const u8 = argv;
+    if (fs) |*f| {
+        if (argv.len > 0 and argv.len <= argv_buf.len) {
+            var g0buf: [2048]u8 = undefined;
+            if (f.hostToGuest(argv[0], &g0buf)) |g0| {
+                // g0 points into g0buf; copy so it outlives this scope (freed at exit).
+                const g0_owned = gpa.dupe(u8, g0) catch argv[0];
+                argv_buf[0] = g0_owned;
+                for (argv[1..], 1..) |a, k| argv_buf[k] = a;
+                argv_g = argv_buf[0..argv.len];
+            }
+        }
+    }
+
     // Tektronix UTek XD88: a static 88K BCS COFF binary. Detected by the COFF
     // magic (or forced with --os utek). This is a self-contained path — UTek
     // binaries are statically linked, so there is no dynamic-linking branch.
     if (os_choice == .utek or (os_choice == null and coff.detect(image))) {
-        return cmdRunUtek(&memory, image, path, argv, if (fs) |*f| f else null, io, gpa);
+        return cmdRunUtek(&memory, image, path, argv_g, if (fs) |*f| f else null, io, gpa);
     }
 
     const img = elf.load(&memory, image) catch |e| {
@@ -194,8 +225,9 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     };
 
     // Select the personality: explicit --os wins, else auto-detect from the
-    // ELF (OpenBSD markers -> openbsd, otherwise SysV/88).
-    const os: Os = os_choice orelse (if (img.is_openbsd) .openbsd else .sysv88);
+    // ELF (OpenBSD markers -> openbsd, NetBSD note -> netbsd, otherwise
+    // SysV/88).
+    const os: Os = os_choice orelse (if (img.is_openbsd) .openbsd else if (img.is_netbsd) .netbsd else .sysv88);
 
     var runner = machine.Runner.init(&memory);
     runner.attachBus(); // sets bus + cpu.reset(); mem.active = &memory
@@ -210,6 +242,10 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
             // ld.so uses `tb0 0,r0,451` as a cache-flush after writing PLT/GOT;
             // treat it as a benign no-op (our memory is coherent).
             runner.cacheflush_vector = 451;
+        },
+        .netbsd => {
+            runner.syscall_vector = nbsd.syscall_vector; // 128
+            runner.handler = &dispatch_netbsd.dispatch;
         },
         .dgux => {
             // DG/UX has TWO syscall gates: 0x1c2 (450, standard) and 0x080
@@ -236,6 +272,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
         pm = procmodel.HostProcess.init(&runner, f, io, gpa);
         pm.?.openbsd = (os == .openbsd);
         pm.?.dgux = (os == .dgux);
+        pm.?.netbsd = (os == .netbsd);
         runner.procmodel = &pm.?;
     }
 
@@ -296,6 +333,13 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
                     return 126;
                 };
             },
+            .netbsd => {
+                // NetBSD/luna88k dynamic binaries would run the guest's own
+                // /usr/libexec/ld.elf_so (like the OpenBSD ld.so path). Our
+                // NetBSD workload is statically linked, so this isn't wired yet.
+                outf("run88k: NetBSD dynamic linking not yet supported ('{s}' is dynamic)\n", .{path});
+                return 126;
+            },
             .utek => unreachable, // UTek is static-only, handled earlier
         }
     }
@@ -303,7 +347,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
     // Environment: minimal for now.
     const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
     switch (os) {
-        .sysv88, .dgux => process.setup(&runner, start_pc, img.brk, argv, &envp) catch |e| {
+        .sysv88, .dgux => process.setup(&runner, start_pc, img.brk, argv_g, &envp) catch |e| {
             // DG/UX static preinit uses the same SVR4 register handoff
             // (r2=argc, r3=argv, r4=envp) — verified from its entry at 0x10011c.
             outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
@@ -322,10 +366,14 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
                 .{ .id = 7, .val = interp_base }, // AUX_base (ld.so, 0 if static)
                 .{ .id = 9, .val = img.entry }, // AUX_entry (exec)
             };
-            process.setupOpenbsd(&runner, start_pc, img.brk, argv, &envp, &aux) catch |e| {
+            process.setupOpenbsd(&runner, start_pc, img.brk, argv_g, &envp, &aux) catch |e| {
                 outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
                 return 126;
             };
+        },
+        .netbsd => process.setupNetbsd(&runner, start_pc, img.brk, argv_g, &envp) catch |e| {
+            outf("run88k: process setup failed: {s}\n", .{@errorName(e)});
+            return 126;
         },
         .utek => unreachable, // handled by the early COFF branch above
     }
@@ -346,7 +394,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, argv: []const []
             return 139; // SIGSEGV-ish
         },
         .timed_out => {
-            outf("run88k: guest timed out after {d} instructions (runaway?)\n", .{runner.steps_run});
+            outf("run88k: guest hit the {d}-instruction budget (raise it with --max-steps N, 0=unlimited; a heavy -O2 compile can need billions)\n", .{runner.steps_run});
             out("recent PCs: ");
             var k: usize = 0;
             while (k < runner.pc_ring.len) : (k += 1) {
@@ -422,7 +470,7 @@ fn cmdRunUtek(
             return 139;
         },
         .timed_out => {
-            outf("run88k: guest timed out after {d} instructions (runaway?)\n", .{runner.steps_run});
+            outf("run88k: guest hit the {d}-instruction budget (raise it with --max-steps N, 0=unlimited; a heavy -O2 compile can need billions)\n", .{runner.steps_run});
             return 124;
         },
         .trap => {

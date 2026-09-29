@@ -19,7 +19,9 @@ const machine = @import("machine.zig");
 const elf = @import("loaders/elf.zig");
 const process = @import("process.zig");
 const sysv = @import("abi/sysv88.zig");
+const nbsd = @import("abi/netbsd.zig");
 const dispatch = @import("syscalls/dispatch.zig");
+const dispatch_netbsd = @import("syscalls/dispatch_netbsd.zig");
 const fsmod = @import("fs.zig");
 const dynamic = @import("loaders/dynamic.zig");
 const procmodel = @import("procmodel.zig");
@@ -60,6 +62,20 @@ fn memOperand(cpu: *const Cpu, op: u32) ?u32 {
         },
         else => return null,
     }
+}
+
+/// True if the opcode is a doubleword memory op (ld.d/st.d/lda.d) that touches
+/// two consecutive words. Immediate forms: op1 0x04 (ld.d), 0x08 (st.d).
+/// Register-indexed (op1 0x3d): op4 in [15:12] == 0x04 (ld.d) or 0x08 (st.d),
+/// or scaled lda.d 0x0c.
+fn isDoubleword(op: u32) bool {
+    const op1 = (op >> 26) & 0x3f;
+    if (op1 == 0x04 or op1 == 0x08) return true;
+    if (op1 == 0x3d) {
+        const op4 = (op >> 12) & 0xf;
+        return op4 == 0x04 or op4 == 0x08 or op4 == 0x0c;
+    }
+    return false;
 }
 
 fn emitRegs(cpu: *const Cpu) void {
@@ -103,16 +119,20 @@ pub fn run(
     }
     defer if (fs) |*f| f.deinit();
 
+    const is_netbsd = img.is_netbsd;
+    const sc_vector: u32 = if (is_netbsd) nbsd.syscall_vector else sysv.syscall_vector;
+
     var runner = machine.Runner.init(&memory);
     runner.attachBus();
-    runner.syscall_vector = sysv.syscall_vector;
-    runner.handler = &dispatch.dispatch;
+    runner.syscall_vector = sc_vector;
+    runner.handler = if (is_netbsd) &dispatch_netbsd.dispatch else &dispatch.dispatch;
     if (fs) |*f| runner.fs = f;
 
     // Process model (fork/exec/wait/pipe), only when a mount table is present.
     var pm: ?procmodel.HostProcess = null;
     if (fs) |*f| {
         pm = procmodel.HostProcess.init(&runner, f, io, gpa);
+        pm.?.netbsd = is_netbsd;
         runner.procmodel = &pm.?;
     }
 
@@ -131,13 +151,20 @@ pub fn run(
     }
 
     const envp = [_][]const u8{"PATH=/usr/bin:/bin"};
-    try process.setup(&runner, img.entry, img.brk, argv, &envp);
+    if (is_netbsd) {
+        try process.setupNetbsd(&runner, img.entry, img.brk, argv, &envp);
+    } else {
+        try process.setup(&runner, img.entry, img.brk, argv, &envp);
+    }
     memory.enforce = true;
 
     var emitted: usize = 0;
     var i: usize = 0;
     const cpu = &runner.cpu;
-    while (i < 50_000_000 and emitted < max_emit) : (i += 1) {
+    // High cap: cc1 runs ~200M instructions before its optimizer hot loops, so
+    // window-tracing a late loop needs a large budget (only windowed
+    // instructions are emitted, so the trace stays small).
+    while (i < 500_000_000 and emitted < max_emit) : (i += 1) {
         const pc = cpu.pc;
         const in_win = pc >= win_lo and pc < win_hi;
         if (in_win) {
@@ -147,6 +174,9 @@ pub fn run(
             // store landing at the wrong offset).
             const maddr = if (memOperand(cpu, op)) |a| a & ~@as(u32, 3) else null;
             const mpre: u32 = if (maddr) |a| (if (@as(u64, a) + 4 <= mem.Memory.size) memory.read32(a) else 0) else 0;
+            // Doubleword ops (ld.d/st.d/lda.d) touch a second word at maddr+4.
+            const is_dbl = isDoubleword(op);
+            const mpre2: u32 = if (is_dbl) (if (maddr) |a| (if (@as(u64, a) + 8 <= mem.Memory.size) memory.read32(a + 4) else 0) else 0) else 0;
 
             // pre-state
             _ = dprintf(1, "{\"pc\":%u,\"op\":%u,\"pre\":", pc, op);
@@ -154,23 +184,27 @@ pub fn run(
             _ = dprintf(1, ",\"cf\":%u", @as(c_uint, cpu.cf));
 
             const res = m88k.step(cpu);
-            if (res == .trapped and cpu.last_exception == sysv.syscall_vector) {
-                _ = dispatch.dispatch(&runner);
+            if (res == .trapped and cpu.last_exception == sc_vector) {
+                _ = runner.handler.?(&runner);
             }
 
             const mpost: u32 = if (maddr) |a| (if (@as(u64, a) + 4 <= mem.Memory.size) memory.read32(a) else 0) else 0;
+            const mpost2: u32 = if (is_dbl) (if (maddr) |a| (if (@as(u64, a) + 8 <= mem.Memory.size) memory.read32(a + 4) else 0) else 0) else 0;
             _ = dprintf(1, ",\"post\":");
             emitRegs(cpu);
             _ = dprintf(1, ",\"cf2\":%u", @as(c_uint, cpu.cf));
             if (maddr) |a| {
                 _ = dprintf(1, ",\"maddr\":%u,\"mpre\":%u,\"mpost\":%u", a, mpre, mpost);
+                if (is_dbl) {
+                    _ = dprintf(1, ",\"mpre2\":%u,\"mpost2\":%u", mpre2, mpost2);
+                }
             }
             _ = dprintf(1, "}\n");
             emitted += 1;
         } else {
             const res = m88k.step(cpu);
-            if (res == .trapped and cpu.last_exception == sysv.syscall_vector) {
-                if (!dispatch.dispatch(&runner)) break;
+            if (res == .trapped and cpu.last_exception == sc_vector) {
+                if (!runner.handler.?(&runner)) break;
             }
         }
         if (memory.fault.kind != .none) {

@@ -35,6 +35,10 @@ pub const LoadedImage = struct {
     /// header such as OPENBSD_RANDOM/WXNEEDED/BOOTDATA). Used to auto-select
     /// the OpenBSD personality when the CLI didn't force one.
     is_openbsd: bool = false,
+    /// True if the object carries a NetBSD ELF note (`.note.netbsd.ident`:
+    /// owner "NetBSD", n_type = 1). Used to auto-select the NetBSD personality
+    /// when the CLI didn't force one.
+    is_netbsd: bool = false,
     /// Guest vaddr of the program header table (for the ELF aux vector's
     /// AT_PHDR). 0 if the phdrs are not covered by a PT_LOAD segment.
     phdr_vaddr: u32 = 0,
@@ -69,6 +73,7 @@ pub const EM_88K = 5; // EM_88K in the ELF machine enum (Motorola 88000)
 pub const PT_LOAD = 1;
 pub const PT_DYNAMIC = 2;
 pub const PT_INTERP = 3;
+pub const PT_NOTE = 4;
 pub const PF_X = 1;
 pub const PF_W = 2;
 pub const PF_R = 4;
@@ -140,6 +145,47 @@ pub fn interpPath(image: []const u8) ?[]const u8 {
         return s;
     }
     return null;
+}
+
+/// Scan the file image's PT_NOTE segments for a NetBSD identity note
+/// (`.note.netbsd.ident`): owner name "NetBSD\0" (namesz=7), n_type = 1
+/// (NT_NETBSD_IDENT). Returns true if found. This is how run88k auto-selects
+/// the NetBSD personality (NetBSD static execs otherwise look like plain
+/// SYSV-ABI m88k ELF, same as SysV/88).
+pub fn hasNetbsdNote(image: []const u8) bool {
+    if (image.len < 0x34) return false;
+    const e_phoff = rd32(image, 28);
+    const e_phentsize = rd16(image, 42);
+    const e_phnum = rd16(image, 44);
+    var i: usize = 0;
+    while (i < e_phnum) : (i += 1) {
+        const ph = e_phoff + i * e_phentsize;
+        if (ph + 32 > image.len) return false;
+        if (rd32(image, ph + 0) != PT_NOTE) continue;
+        const p_offset = rd32(image, ph + 4);
+        const p_filesz = rd32(image, ph + 16);
+        if (@as(u64, p_offset) + p_filesz > image.len) continue;
+        // Walk the notes in this segment: {namesz, descsz, type, name[], desc[]}
+        // with 4-byte alignment on name and desc.
+        var off: usize = p_offset;
+        const end: usize = p_offset + p_filesz;
+        while (off + 12 <= end) {
+            const namesz = rd32(image, off + 0);
+            const descsz = rd32(image, off + 4);
+            const ntype = rd32(image, off + 8);
+            const name_at = off + 12;
+            const name_pad = (namesz + 3) & ~@as(u32, 3);
+            const desc_pad = (descsz + 3) & ~@as(u32, 3);
+            if (name_at + namesz > end) break;
+            if (ntype == 1 and namesz >= 7 and
+                std.mem.eql(u8, image[name_at .. name_at + 6], "NetBSD"))
+            {
+                return true;
+            }
+            off = name_at + name_pad + desc_pad;
+        }
+    }
+    return false;
 }
 
 /// Validate the ELF header for an m88k big-endian object. Returns nothing on
@@ -247,6 +293,7 @@ pub fn load(memory: *mem.Memory, image: []const u8) Error!LoadedImage {
         if (pt == PT_OPENBSD_RANDOMIZE or pt == PT_OPENBSD_WXNEEDED or
             pt == PT_OPENBSD_BOOTDATA or pt == PT_OPENBSD_NOBTCFI) is_obsd = true;
     }
+    const is_nbsd = hasNetbsdNote(image);
 
     // Locate the program header table in guest memory (AT_PHDR): find the
     // PT_LOAD whose file range covers e_phoff, then map the offset through.
@@ -277,6 +324,7 @@ pub fn load(memory: *mem.Memory, image: []const u8) Error!LoadedImage {
         .dynamic_vaddr = obj.dynamic_vaddr,
         .is_dynamic = is_dyn,
         .is_openbsd = is_obsd,
+        .is_netbsd = is_nbsd,
         .phdr_vaddr = phdr_vaddr,
         .phent = e_phentsize,
         .phnum = e_phnum,

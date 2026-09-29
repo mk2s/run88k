@@ -292,3 +292,367 @@ kind==1. The gate `cmp(kind,1)` / `bb0 #3` was verified to behave correctly
 path we're not triggering — not yet localized to a single divergent instruction.
 This differs from `dis`, which uses libelf's low-level section walk and works.
 Deferred.
+
+
+---
+
+# NetBSD/luna88k toolchain — status
+
+GCC 3.3.6, static binaries under `/usr/bin` (as/ld/cc/gcc/cpp) + `/usr/libexec/{cc1,cc1plus,cc1obj}`.
+
+## Working
+- **`/usr/bin/as`** — assembles a `.s` to a valid ELF32-BE MC88000 relocatable
+  (byte-exact `.text`, correct symtab/sections) on the first try.
+- **`cc -c hello.c`** — the full driver forks **cpp → cc1 → as** and produces a
+  valid 888-byte ELF object (`main` FUNC + `printf` UND). Verified clean under
+  host `readelf`.
+- **`make`** — drives rules correctly: `@`-silenced multi-command rules,
+  `cc -c` via fork/exec/wait, `rm` (clean), dependency up-to-date checks, and
+  correct error propagation on failure (`*** Error code 1` / `Stop`).
+
+Two fixes were needed for the driver to find its sub-tools:
+1. **argv[0] must be the guest path.** The run target is a host path (so we can
+   read the file), but GCC derives its tool-search *exec prefix* from argv[0].
+   Leaving `/mnt/netbsd/usr/bin/cc` there made cc look for `cc1` at
+   `/mnt/netbsd/usr/bin/cc1` (then PATH-fall-back `/bin/cc1`) and never find
+   `/usr/libexec/cc1`. Fix: `fs.hostToGuest()` reverse-maps the host path
+   through the mount table, and `cmdRun` rewrites argv[0] to the guest path
+   (`/usr/bin/cc`). Benefits every personality's toolchain.
+2. The vfork r2/r3 dual-return and `/dev/stdin` fdesc fixes (see
+   `docs/abi-netbsd.md`) were prerequisites for cc's fork/exec of its phases.
+
+## RESOLVED: full `cc -o` / `make <exe>` works end-to-end
+
+`cc -o hello hello.c` now compiles AND links a real C program (cpp → cc1 → as →
+**ld** against the static `/usr/lib/libc.a`) to a valid statically-linked
+`ELF 32-bit MSB executable, Motorola m88k, for NetBSD`, and the result **runs**
+under run88k (prints via printf, returns its exit code). `nm /usr/lib/libc.a`
+also reads to completion, and `make <exe>` drives the whole pipeline.
+
+### Root cause: lseek 64-bit return word order (a SYSCALL bug, not a core bug)
+`lseek` returns a 64-bit `off_t`. On big-endian m88k a 64-bit value in a
+register pair is **high word first**, so the kernel returns the new position as
+**r2 = high word, r3 = low word**. Our `sysLseek` returned it backwards
+(`returnSuccess2(lo, hi)` → r2=lo, r3=hi). For any position ≥ a few KB, libc/BFD
+read the LOW word (e.g. `0xc000`) as the HIGH half of its 64-bit file position;
+every subsequent seek then targeted `position << 32`, the host rejected it
+(EINVAL), and BFD reported the archive as "File truncated". Fix: `sysLseek`
+returns `returnSuccess2(hi, lo)` (r2=hi, r3=lo). One line; unblocked the entire
+linker/`nm`/toolchain.
+
+How it was found (the method matters for the sibling personalities): built
+`tools/m88k_eval.py`, an offline evaluator that recomputes every traced
+instruction's result (ALU, carry chain, bit-field, loads-vs-memory, and
+store-value verification) and found **zero** CPU divergences in the whole
+failing run — proving the core executed faithfully and the bad data had to enter
+via a syscall return. Back-tracing the bad high word through loads/stores/adds
+landed on a `tb0` (syscall) as the source register's writer: the lseek return.
+
+The investigation write-up below is kept as historical record.
+
+### (historical) What was traced before the fix
+ld issues an `lseek` on the archive (via the indirect `__syscall`(198) gate,
+real number 199) with a **64-bit `off_t` whose HIGH word is a bogus member-base
+
+### What was traced
+ld issues an `lseek` on the archive (via the indirect `__syscall`(198) gate,
+real number 199) with a **64-bit `off_t` whose HIGH word is a bogus member-base
+value** (e.g. `off_hi=0x192000, off_lo=0x1000`), which the host rejects
+(`pos=-1`), so ld concludes the archive is truncated. Good seeks in the same run
+have `off_hi=0`. The off_t register pairing is confirmed CORRECT (decoded the
+lseek stub `0x9c220` → the inline `__syscall` gate `0x877a0`; after the
+shift-by-2 the args are fd=arg0, pad=arg1, off_hi=arg2, off_lo=arg3,
+whence=arg4). So ld is genuinely being handed a bad high word — the value flows
+from ld's own 64-bit archive-offset arithmetic (`subu.co/subu.ci` then
+`addu.co/addu.ci`, and a page-align `and` of an `ext`-sign-extended pair around
+`ld` PC `0x89500–0x89600`). This points at a **musashi88k core divergence** in
+that 64-bit sequence (candidate ops verified individually against nono —
+`ext rD,rS,32<31>` and the `addu.co/.ci` carry chain each compute correctly in
+isolation — so the divergence is likely an *interaction* / an upstream value,
+not one of those ops alone).
+
+### Repro + tooling for next session
+- Reproduce ld directly (no cc): compile a fixed object then run ld:
+  ```
+  run88k --root /mnt/netbsd --mount /work=/tmp/nbwork --cwd /work \
+     run /mnt/netbsd/usr/bin/cc -c hello.c
+  run88k --root /mnt/netbsd --mount /work=/tmp/nbwork \
+     run /mnt/netbsd/usr/bin/ld -dc -dp -e _start \
+     -dynamic-linker /usr/libexec/ld.elf_so -o /work/hello \
+     /usr/lib/crt0.o /usr/lib/crti.o /usr/lib/crtbegin.o -L/usr/libexec \
+     /work/hello.o -lgcc -lc -lgcc /usr/lib/crtend.o /usr/lib/crtn.o
+  ```
+- **`difftrace` is now NetBSD-aware** (`src/difftrace.zig` auto-selects the
+  NetBSD personality/vector/startup from the ELF note). Generate a JSONL trace
+  over a PC window and replay against the nono oracle with
+  `tools/difftrace.py` to find the first divergent instruction, e.g.:
+  ```
+  run88k --root /mnt/netbsd --mount /work=/tmp/nbwork \
+     difftrace /mnt/netbsd/usr/bin/ld <lo> <hi> <max> <ld args, output to /work/...>
+  ```
+  NOTE: difftrace has no `--cwd`, so pass absolute guest output paths
+  (`-o /work/hello`, `/work/hello.o`). A first attempt hit a *different* offset
+  in the difftrace run than the full `cc -o` run (setup/argv differences), so
+  the next step is to widen the window to cover ld's whole archive-read path and
+  replay from the start to find the FIRST divergence, rather than assuming the
+  page-align `and` at `0x895e8` is the fault (it computes correctly on the
+  values seen in the difftrace instance).
+
+### Session 3 reframing — likely NOT a CPU-core bug; suspect archive data
+Built `tools/m88k_eval.py`, an offline m88k evaluator that recomputes each
+traced instruction's result from its own pre-state + opcode (and, for loads, the
+captured memory word) and flags the first mismatch vs the recorded post-state —
+no per-instruction nono calls needed. Extended `src/difftrace.zig` to capture the
+SECOND word of doubleword mem ops (`mpre2`/`mpost2` for `ld.d`/`st.d`).
+
+Ran it on a much simpler repro — **`nm /usr/lib/libc.a`** also fails "File
+truncated" (reads several members, then fails at a specific one). Results across
+the whole failing run (637k instructions, 261k modeled):
+- **Zero divergences** in: all ALU-immediate ops, triadic reg ops incl. the
+  `addu.co`/`addu.ci`/`subu.co`/`subu.ci` carry chain, `and/or/xor/mask/cmp`,
+  the bit-field group (`ext/extu/mak/rot/clr/set`), word `ld`, `ld.d` (both
+  words vs memory), and **store verification** (`st`/`st.d` wrote the correct
+  source-register value).
+So run88k executes this instruction stream **faithfully** — the CPU core is not
+mis-computing anything on this path.
+
+The failing `lseek` offset is genuinely built by nm/ld as a 64-bit `off_t` with
+the member file-offset (e.g. `0xd000`, `0x192000`) in the **HIGH word** and a
+small delta in the low word (`{hi=0xd000, lo=0}` etc.). Traced all the way back:
+that high-word value is *carried consistently* through loads/stores/adds from a
+struct field in nm's memory — every step verified correct. Since real NetBSD nm
+does NOT do this, the divergence must come from **input DATA**, not instruction
+execution: the only thing entering the CPU from outside is what our syscalls
+return. Prime suspect: the **archive `read()` content / binary armap**
+(`__.SYMDEF`, big-endian 32-bit member offsets) — if nm parses a member offset
+into the wrong half of a 64-bit field because the bytes it read differ from the
+real file (wrong offset, short read, or a byte-order/packing mismatch in how nm
+reads the armap under our environment), it would then *correctly* compute a bad
+64-bit seek.
+
+**Next step:** dump the exact bytes `read()` delivers for libc.a around the
+armap and the failing member header, and diff against the real file bytes at the
+same offsets. Also worth checking: whether nm/ld take a different code path based
+on some earlier syscall result (e.g. an `fstat` field, `sysctl`, or `fcntl`)
+that we answer differently from the real kernel, steering it into a 64-bit-offset
+branch it shouldn't use. `tools/m88k_eval.py` + the dbl-word difftrace are kept
+for the continued hunt.
+
+### Session 2 notes (superseded by session 3 reframing above) — ruled out the two known prior culprits
+Two fixes from the OpenBSD toolchain bring-up (commit `c3b60bb`) were the first
+suspects, matching a "lseek word-order / stack-not-cleaned" memory:
+- **exec-time register-file cleanup** (zero r0..r31 + clear `branch_pending` on
+  exec): **RULED OUT** — running `ld` *directly* (a clean top-level process, no
+  fork/exec) fails identically to the cc-forked `ld`. So it is not stale-state.
+- **lseek off_t word order** (OpenBSD's was initially `off_lo=arg2/off_hi=arg3`,
+  corrected to `off_hi=arg2/off_lo=arg3`): **RULED OUT** — NetBSD already uses
+  the corrected order, small in-range seeks (off in the low word) succeed, and
+  no hi/lo swap makes the failing seek (`hi=0x192000, lo=0x1000`) sane.
+
+Backward dataflow from the failing `lseek` (via a full-register `difftrace` of
+direct `ld`, window `0x88000–0x8a000`, 12.8k rows that reproduce the failure):
+the bad 64-bit `off_t` `{hi=0x192000, lo=…}` is **carried in the high word from
+very early** and merely copied/added along the chain
+(`lseek arg ← r4:r5 ← r14:r15 ← st.d@0x5ab4c → ld@0x617bc → addu.co/.ci@0x617c0
+→ …`). At every step checked, the arithmetic is CORRECT:
+- `ext r16,r17,32<31>` (sign-extend) — matches nono for all executions.
+- `addu.co`/`addu.ci` 64-bit carry chain — matches nono (verified a carry case
+  on the oracle: `0xfffff000+0x2000` then `+carry` gives the right high word).
+- All ALU-immediate ops recompute-check clean across the whole window.
+`0x192000` itself is a **legitimate** 32-bit file offset (`0x191ffc + 4`, a real
+libc.a member position) — it is only wrong in that it sits in the HIGH word.
+
+**Current best hypothesis:** since every *register* op on the path matches the
+oracle, the divergence is most likely a **load reading wrong bytes** (a
+register-indexed / `.d` load from a miscomputed address, or memory corrupted by
+an earlier mis-targeted store) somewhere in ld's archive **armap** (symbol
+index) reading, which then seeds the swapped-looking 64-bit offset. This matches
+the documented core-fix history (register-indexed load, `ld.hu`/`ld.bu` decode).
+The definitive next step is a **full first-divergence replay** of the direct-`ld`
+trace against nono (not spot checks): walk the trace, replay each op from its
+pre-state through the oracle, and stop at the first post-state mismatch — that
+pinpoints the faulting instruction. difftrace is NetBSD-aware now, so the only
+missing piece is an automated per-row oracle-replay loop over the (large) trace.
+
+
+## NetBSD kernel build attempt (GENERIC/luna88k)
+
+Tried building a real NetBSD/luna88k GENERIC kernel from the host source tree
+(`~/Documents/netbsd-src`, current NetBSD) using the guest 3.0.1 toolchain,
+mounted as `--mount /usr/src=<tree>` plus a writable `--mount /tmp=<dir>`.
+
+Got a long way:
+- **`config GENERIC`** runs under run88k and generates the full compile
+  directory (Makefile + all config `.h` headers + the `machine`/`m88k`
+  symlinks).
+- **`make`** drives the real kernel build: `cc -ffreestanding -O2 ... -c` on
+  kernel sources, `genassym.sh` (awk) generates `assym.h`, `locore.o` (assembly
+  via `cc -x assembler-with-cpp`) compiles. **5 kernel objects compiled**
+  cleanly (swapnetbsd.o, devsw.o, ioconf.o, param.o) before hitting the issue
+  below.
+
+Two real run88k bugs were found and fixed doing this:
+1. **`/dev/null` (and `/dev/zero`, `/dev/tty`) open support.** `config`/`make`
+   open `/dev/null` constantly; we only handled `/dev/std*` + `/dev/fd/N`.
+   `sysOpen` now opens the host equivalent directly for these nodes.
+2. **argv entries truncated at 255 bytes.** `sysExec`'s `readStrVec` used a
+   `[256]u8` per-arg buffer. The kernel build's `genassym.sh`/`m88k-move.sh`
+   pass a ~1.5 KB awk program as a SINGLE argv entry; truncation cut it mid-
+   program ("awk: syntax error at source line 12", empty context). Now uses a
+   4 KB per-arg buffer, heap-allocated (via the procmodel gpa) to keep the exec
+   stack frame small. This affects any long command line, not just the kernel.
+
+Two environment mismatches (not run88k bugs), worked around:
+- Needs a **writable `/tmp`** (`genassym.sh` writes `/tmp/$$.c`): mount one.
+- **`config_file.h`**: the host `param.c` `#include`s it unconditionally, but
+  the 2005-era guest `config(8)` does not emit it (version skew between the
+  current source tree and the 3.0.1 config binary). A minimal stub
+  `config_file.h` in the compile dir gets past it.
+
+### Open bug: cc1 infinite loop compiling `netinet/igmp.c` (diagnosis so far)
+Narrowed extensively (session 4):
+- **Optimizer-only:** `-O0` compiles igmp.c fine; `-O1` and `-O2` both hang.
+- **One function:** bisected the preprocessed `igmp.i` per-function — only
+  **`igmp_input`** hangs; all 9 other functions compile at -O2. (igmp_input is
+  the big ~240-line function with four nested `switch`es on IGMP state.)
+- **Deterministic infinite loop, not slow work:** two runs stop at the
+  byte-identical recent-PC ring. The hot loop is cc1 code at
+  **0x19c20c–0x19c25c** repeatedly calling GCC's **`bitmap_bit_p`** (0x200d90)
+  and another bitmap routine (0x201c70) — i.e. GCC's bitmap-based **dataflow**
+  fixpoint never converges. The loop-head register trace shows a **cyclic**
+  pattern: a pointer `r17` walks heap nodes and a counter `r24` cycles
+  4→3→2→…→0x1e→4… — a data structure GCC expects to be acyclic has become
+  circular.
+- **CPU executes faithfully where traced:** `tools/m88k_eval.py` found ZERO
+  divergences across ~1.09M modeled cc1 startup ops and the 20k-instruction loop
+  window; `extu rD,rS,rS` (the bit-extract in `bitmap_bit_p`, incl. offset 31)
+  matches nono. So this is the same "faithful CPU, corrupted DATA" shape as the
+  lseek bug — the corrupting write happens somewhere in cc1's earlier analysis
+  (buried in ~200M instructions before the visible loop) and hasn't been
+  surfaced yet.
+- **Red herrings:** at `-O1`, disabling almost any single pass (`-fno-gcse`,
+  `-fno-thread-jumps`, …) avoids the hang, but NONE of them fix it at `-O2`
+  (they just perturb the RTL). So it is not one specific pass.
+
+**Next:** the corruption is upstream of the visible dataflow loop. Options:
+(a) window-difftrace the bitmap routines themselves (0x200d90 and 0x201c70) to
+verify their internal ops against nono; (b) find where the cyclic list/`r17`
+chain is built and diff that construction against the oracle; (c) since cc1 for
+other files works, diff igmp_input's cc1 run against a known-good short function
+to bisect which analysis phase diverges. This is a large differential effort;
+the CPU-faithful evidence suggests looking for a bad STORE/pointer computation
+(the class the offline evaluator can't see once it's in memory), same as lseek.
+
+Repro (isolated, no make/driver needed):
+```
+# preprocess once: cc ... -E -o /tmp/igmp.i ../../../../netinet/igmp.c
+cc1 -fpreprocessed igmp.i -quiet -O2 -o out.s      # hangs (igmp_input)
+cc1 -fpreprocessed igmp.i -quiet -O0 -o out.s      # OK
+```
+A ready repro is staged: `repro/igmp.i` + `tools/repro-igmp-hang.sh`.
+
+### RESOLVED: it was the step budget, not a bug
+The "hang" was **not** an infinite loop or a core divergence — the emulator's
+per-process instruction budget (`default_max_steps`, formerly 200M) was simply
+too small for a heavy `-O2` compile. Real NetBSD/m88k under nono full-system
+needs ~83s of user CPU to compile igmp.c at -O2; an interpreting emulator runs
+~50–100× slower, so the real emulated instruction count is in the **billions**,
+far past 200M. run88k hit the budget mid-compile and printed
+"timed out (runaway?)" with a loop-looking recent-PC ring (just a snapshot of a
+long-but-finite compile). FPU was ruled out along the way (cc1 executes ZERO
+SFU1/FP instructions on igmp.i).
+
+**Fix:** `machine.Runner.default_max_steps` raised to 20e9 and made a `pub var`;
+the run loop treats `max_steps == 0` as unlimited; `main.zig` adds
+`--max-steps N` (0 = unlimited). With this, `cc -O2 igmp.i` completes in ~26s
+(exit 0, valid 1237-line .s) and `make igmp.o` produces a 7272-byte object. The
+full GENERIC kernel `make` then compiles cleanly through every file (the whole
+TCP/IP stack: in.c, ip_input.c, ip_icmp.c, …) with zero errors — it's just slow
+(hundreds of files × tens of seconds each under interpretation = many hours).
+
+### RESOLVED: the final link — argv entry-count cap (256 → 1024)
+The final `ld` step of the kernel link initially produced 3232 bogus "undefined
+reference" errors. The `ld` command GENERIC emits lists one token per object
+file — **>300 argv tokens** for GENERIC. `sysExec` capped the argv/envp vectors
+at **256 entries** (`argv_store: [256][]const u8`, `alloc([4096]u8, 256)`),
+silently truncating the object list; every symbol defined in a dropped object
+then looked undefined. (Running the same `ld` directly with `$OBJS` gave 0
+undefined; only the shell-driven `>256`-token form failed — the tell.)
+
+Raised `ARG_MAX_COUNT` to **1024** (with `ARG_MAX_LEN` still 4 KB per arg).
+`readStrVec` already bounds by `out.len`, so it picked up the new size. After
+this, the GENERIC/luna88k kernel links to completion:
+
+```
+#      link  GENERIC/netbsd
+ld -N -Ttext 0x20000 -e start -S -o netbsd ${SYSTEM_OBJ} ${EXTRA_OBJ} vers.o
+   text	   data	    bss	    dec	    hex	filename
+1410012	  67136	  84448	1561596	 17d3fc	netbsd
+```
+
+Result: a valid **1.72 MB static ELF32-BE MC88000** `netbsd` kernel, entry
+`start` @ 0x20000, with `.text`/`.rodata`/`.data`/`.bss` and the expected
+kernel symbols (`main`, `cpu_startup`, `version`, `copyright`). A full
+NetBSD/luna88k GENERIC kernel builds and links end to end under run88k.
+
+Build invocation (root mounted at /mnt/netbsd, source tree + writable /tmp):
+```
+run88k --os netbsd --root /mnt/netbsd \
+  --mount /usr/src=<netbsd-src> --mount /tmp=<writable> --max-steps 0 \
+  --cwd /usr/src/sys/arch/luna88k/compile/GENERIC \
+  run /mnt/netbsd/usr/bin/make netbsd
+```
+(First: `config GENERIC`, then stub `config_file.h` — see notes above.)
+
+Lesson: distinguish "timed out at the step budget" from "infinite loop" before
+assuming a bug — bump `--max-steps` (or use 0) first. Everything below this line
+is the earlier (mistaken) bug hunt, kept for the record.
+
+### FPU ruled OUT
+The nono full-system log showed the guest kernel logging `rte: SFIP.V==0 (NOT
+IMPLEMENTED)` during the compile, suggesting FP exceptions — but instrumenting
+run88k showed cc1 executes **zero SFU1 (FP) instructions** compiling igmp.i (at
+both -O0 and -O2). Those `rte` messages are unrelated kernel background noise.
+So the FPU is not involved; it's an **integer** divergence.
+
+### Refined conclusion: a control-flow divergence the offline evaluator can't see
+`tools/m88k_eval.py` verifies each instruction's *destination value*
+independently (ALU, carry, bit-field, loads-vs-memory, store value, AND store/
+load effective-address) and found ZERO divergences across every window traced.
+But it validates each instruction **in isolation from its own recorded
+pre-state** — it structurally **cannot** detect a WRONG BRANCH (a `bcnd`/`bb1`/
+`bb0` condition or a delay-slot interaction computed wrong): a mis-taken branch
+yields a different instruction *sequence*, yet each instruction in that (wrong)
+sequence still "matches" when recomputed from its own pre-state. Basic
+delay-slot mechanics are oracle-verified (see core-fixes.md), but subtle cases
+(condition-mask evaluation, a delay slot that modifies the branch's condition
+register, nested/back-to-back delayed branches) are not exhaustively covered.
+This "faithful per-instruction, wrong sequence" shape matches the symptom (a
+GCC dataflow/list structure that becomes cyclic → non-terminating loop, with all
+data values individually correct).
+
+**Next tool needed:** lockstep PC comparison against nono — replay the
+instruction stream through the oracle letting NONO choose each next PC, and stop
+at the first PC that diverges from run88k. That catches control-flow bugs the
+value-only evaluator misses. The challenge is reaching the divergence (~200M
+instructions into cc1); needs a checkpoint/fast-forward or a much smaller repro
+(bisecting igmp_input's body further — `cut_d` = body through line 217 already
+reproduces).
+
+### (superseded) earlier note: cc1 runaway loop compiling `netinet/igmp.c`
+With the above in place, compiling the first real networking source
+(`../../../../netinet/igmp.c`) makes **cc1 spin forever** — run88k times out at
+200M instructions. The recent-PC ring shows a tight ~15-instruction loop in cc1
+at **0x1f2288–0x1f22e0** (back-edge `bb1` at 0x1f22e0). The loop is bit-field /
+find-first-bit heavy (`ext`/`mak` and `f0a89822`/`f0a99828` which look like
+`ff1`/`ff0`). Earlier files (param.c etc.) compiled fine, so cc1 works broadly;
+igmp.c triggers a non-terminating loop — likely a subtle CPU-core edge case
+(off-by-one in a bit-scan/`ff1`/`ext` width) that never satisfies the loop exit,
+or a genuinely long computation. **Next:** difftrace that PC window
+(`0x1f2280 0x1f22f0`) and replay against nono / the offline evaluator
+(`tools/m88k_eval.py`) to find the first divergent instruction, same method that
+cracked the lseek bug. Repro:
+```
+config GENERIC ; echo '/* stub */' > .../compile/GENERIC/config_file.h
+make igmp.o     # (with --mount /tmp=<writable> and /usr/src=<tree>)
+```
