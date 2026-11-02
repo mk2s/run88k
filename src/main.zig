@@ -1,9 +1,16 @@
 //! run88k — m88k user-mode syscall emulator (CLI entry).
 //!
-//! Milestone 2: `run <binary> [args...]` loads a static ELF32-BE MC88000
-//! executable (UNIX System V/88), sets up the SysV/88 register-handoff process
-//! stack, installs the syscall dispatcher (trap vector 451, number in r9), and
-//! runs the guest, servicing syscalls against the host.
+//! `run <binary> [args...]` loads an MC88000 executable (ELF32-BE or, for
+//! Tektronix UTek, 88K BCS COFF), sets up the per-personality process stack,
+//! installs the matching syscall dispatcher, and runs the guest, servicing
+//! syscalls against the host. Five personalities are supported — SysV/88,
+//! OpenBSD, NetBSD, Tektronix UTek, and DG/UX — auto-detected from the image or
+//! forced with `--os`. Static and dynamically-linked binaries both run (SysV/88
+//! and DG/UX self-link in-process; OpenBSD runs the guest's own ld.so).
+//!
+//! `difftrace <binary> <lo> <hi> <max> [args...]` emits a per-instruction JSONL
+//! trace for a PC window, for lockstep differential testing against the nono
+//! oracle. `--selftest` runs a core-integration self-check.
 //!
 //! Uses the current Zig "full" main signature `main(init: std.process.Init)`
 //! and a libc `write` extern for output (stable across the churning std.Io
@@ -144,13 +151,29 @@ pub fn main(init: std.process.Init) !void {
     }
 
     out(
-        \\run88k — m88k user-mode syscall emulator (Milestone 2)
+        \\run88k — m88k user-mode syscall emulator
         \\
         \\Usage:
-        \\  run88k [--trace] run <binary> [args...]   run a SysV/88 m88k ELF binary
-        \\  run88k --selftest                          core-integration self-check
+        \\  run88k [flags] run <binary> [args...]
+        \\      Load and run an MC88000 guest binary, servicing its syscalls.
+        \\  run88k [flags] difftrace <binary> <lo-hex> <hi-hex> <max> [args...]
+        \\      Emit a per-instruction JSONL trace for PCs in [lo,hi) (core debugging).
+        \\  run88k --selftest
+        \\      Core-integration self-check.
         \\
-        \\Only static ELF32-BE MC88000 executables are supported so far.
+        \\Flags:
+        \\  --root DIR         mount DIR as the guest /
+        \\  --mount G=H        mount host path H at guest prefix G (repeatable)
+        \\  --cwd DIR          guest-absolute initial working directory
+        \\  --os NAME          force personality: sysv88, openbsd, netbsd, utek, dgux
+        \\                     (auto-detected from the image when omitted)
+        \\  --trace            strace-style per-syscall logging to stderr
+        \\  --trace-all        per-instruction PC/register trace (deep core debugging)
+        \\  --watch HEX        watch a guest memory address
+        \\  --max-steps N      instruction budget (0 = unlimited)
+        \\
+        \\Formats: ELF32-BE MC88000 (SysV/88, OpenBSD, NetBSD, DG/UX) and 88K BCS
+        \\COFF (UTek). Static and dynamically-linked binaries are both supported.
         \\
     );
 }

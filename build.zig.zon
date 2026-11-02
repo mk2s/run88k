@@ -2,13 +2,16 @@
     .name = .run88k,
     .version = "0.0.0",
     .fingerprint = 0xfa6452e5eb5642e3,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // The MC88100 CPU core. Consumed as source (its root.zig exposes the
-        // native Zig API: cpu.Cpu, cpu.MemoryBus, decode.step). Referenced as a
-        // local path dependency to the sibling checkout.
+        // native Zig API: cpu.Cpu, cpu.MemoryBus, decode.step). Fetched and
+        // cached automatically by `zig build` — no sibling checkout needed.
+        // Pinned to a specific commit for reproducible builds; bump the URL +
+        // hash (via `zig fetch --save`) to update.
         .musashi88k = .{
-            .path = "../musashi88k",
+            .url = "https://github.com/mk2s/musashi88k/archive/2507c3aa622416ac5a4c73b195ecace818ff7752.tar.gz",
+            .hash = "musashi88k-0.1.0-gE1prxTfAQBBUIHX2HCIUq2EFezpg9tRB5rBQvd8_0c2",
         },
     },
     .paths = .{
